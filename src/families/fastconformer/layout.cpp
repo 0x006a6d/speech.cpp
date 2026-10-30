@@ -76,12 +76,24 @@ std::vector<TensorSpec> tensors(const ModelFile & m) {
         m.size(p + "decoder.rnnt.max_symbols");
     }
     const int prediction_layers = m.count(p + "decoder.prediction_layers");
+    const bool kda = m.one_of(p + "decoder.prediction", {"lstm", "kda"}) == "kda";
+    int64_t kda_heads = 0, kda_dim = 0, kda_conv = 0;
+    if (kda) {
+        kda_heads = m.size(p + "decoder.kda.num_heads");
+        kda_dim = m.size(p + "decoder.kda.head_dim");
+        kda_conv = m.size(p + "decoder.kda.conv_size");
+        // The short convolution keeps the inputs before the label's, of which it has at least one.
+        require(kda_conv >= 2, m, "fastconformer.decoder.kda.conv_size is less than 2");
+        m.f32(p + "decoder.kda.norm_eps");
+        m.f32(p + "decoder.kda.output_norm_eps");
+    }
     m.str_array(p + "segment.separators");
     m.str_array(p + "segment.breaks");
     require(m.str_array(p + "tokenizer.tokens").size() == blank, m, "the blank does not follow the last of fastconformer.tokenizer.tokens");
     require(m.u32(p + "tokenizer.unknown_id") < blank, m, "fastconformer.tokenizer.unknown_id is not a piece");
     m.str(p + "tokenizer.unknown_surface");
     m.boolean(p + "tokenizer.strip_leading_space");
+    m.boolean(p + "tokenizer.byte_fallback");
     m.str_array(p + "tokenizer.punctuation");
 
     // The window's length and the widths of the subsampling's channels, the feed-forward layers, the prediction network
@@ -135,6 +147,25 @@ std::vector<TensorSpec> tensors(const ModelFile & m) {
                       {"attn_v.bias", {d}, kF32},      {"attn_out.bias", {d}, kF32},   {"conv_pw1_a.bias", {d}, kF32},
                       {"conv_pw1_gate.bias", {d}, kF32}, {"conv_pw2.bias", {d}, kF32}});
     }
+    if (kda) {
+        // A KDA block: its LayerNorm, the projections of q, k and v and their convolutions' kernels, the low-rank
+        // projections of the decay and of the output gate, whose rank is the width of one tensor, the decay's A_log of
+        // each head and dt_bias of each key channel, the heads' RMSNorm and the output projection.
+        const int64_t channels = kda_heads * kda_dim, rank = m.width("pred.kda.0.f_down.weight", 1);
+        add_numbered(t, "pred.kda.", prediction_layers,
+                     {{"norm.weight", {predicted}, kF32},           {"norm.bias", {predicted}, kF32},
+                      {"q.weight", {predicted, channels}, kMatrix}, {"k.weight", {predicted, channels}, kMatrix},
+                      {"v.weight", {predicted, channels}, kMatrix}, {"q_conv.weight", {kda_conv, channels}, kF32},
+                      {"k_conv.weight", {kda_conv, channels}, kF32}, {"v_conv.weight", {kda_conv, channels}, kF32},
+                      {"f_down.weight", {predicted, rank}, kF32},   {"f_up.weight", {rank, channels}, kF32},
+                      {"b.weight", {predicted, kda_heads}, kF32},   {"g_down.weight", {predicted, rank}, kF32},
+                      {"g_up.weight", {rank, channels}, kF32},      {"g_up.bias", {channels}, kF32},
+                      {"a_log", {kda_heads}, kF32},                 {"dt_bias", {channels}, kF32},
+                      {"out_norm.weight", {kda_dim}, kF32},         {"out.weight", {channels, predicted}, kMatrix}});
+        t.push_back({"pred.final_norm.weight", {predicted}, kF32});
+        t.push_back({"pred.final_norm.bias", {predicted}, kF32});
+        return t;
+    }
     // An LSTM layer's four gates, input, forget, cell and output, are stacked in its matrices and its summed biases.
     add_numbered(t, "pred.lstm.", prediction_layers,
                  {{"ih.weight", {predicted, 4 * predicted}, kMatrix}, {"hh.weight", {predicted, 4 * predicted}, kMatrix},
@@ -143,19 +174,23 @@ std::vector<TensorSpec> tensors(const ModelFile & m) {
 }
 
 /**
- * Brings layout 1, the one before, up: layout 2 adds fastconformer.decoder.rnnt.max_symbols, the most tokens greedy
- * RNN-T decoding emits on one frame. Layout 1's converter took one RNN-T checkpoint, reazonspeech-nemo-v2, whose
- * decoding.greedy.max_symbols is 10.
+ * Brings layouts 1 and 2 up. Layout 2 adds fastconformer.decoder.rnnt.max_symbols, the most tokens greedy RNN-T
+ * decoding emits on one frame: layout 1's converter took one RNN-T checkpoint, reazonspeech-nemo-v2, whose
+ * decoding.greedy.max_symbols is 10. Layout 3 adds fastconformer.decoder.prediction, the kind of the prediction
+ * network, and fastconformer.tokenizer.byte_fallback: every checkpoint before it has LSTM layers, and a tokenizer
+ * without byte pieces, which the converter refused.
  */
 void upgrade(ModelFile & m) {
-    if (m.one_of("fastconformer.decoder.kind", {"tdt", "rnnt"}) == "tdt") return;
+    m.upgrade_str("fastconformer.decoder.prediction", "lstm");
+    m.upgrade_bool("fastconformer.tokenizer.byte_fallback", false);
+    if (m.layout_version() >= 2 || m.one_of("fastconformer.decoder.kind", {"tdt", "rnnt"}) == "tdt") return;
     require(m.str("general.name") == "reazonspeech-nemo-v2", m, "it is an RNN-T model of layout 1 other than reazonspeech-nemo-v2");
     m.upgrade_u32("fastconformer.decoder.rnnt.max_symbols", 10);
 }
 
 }  // namespace
 
-const Layout layout = {"fastconformer", 2,
+const Layout layout = {"fastconformer", 3,
                        "convert it again with reference/fastconformer/convert.py, or download it again from its Hugging Face "
                        "repository",
                        tensors, upgrade};

@@ -2,9 +2,10 @@
 
 usage: uv run python convert.py <model> <out dir>
 
-Writes parakeet-tdt_ctc-0.6B-ja-F32.gguf, parakeet-tdt-0.6B-v3-F32.gguf or reazonspeech-nemo-619M-v2-F32.gguf, named
-under GGUF's naming convention, in layout 2: the frontend's window and mel filterbank, the subsampling, the conformer
-layers, the prediction network and the joint, with the SentencePiece pieces the token ids name, the settings of the
+Writes parakeet-tdt_ctc-0.6B-ja-F32.gguf, parakeet-tdt-0.6B-v3-F32.gguf, reazonspeech-nemo-619M-v2-F32.gguf or, run from
+reference/haas-ja/convert.py, Haas-616M-ja-v1.0-F32.gguf, named under GGUF's naming convention, in layout 3: the
+frontend's window and mel filterbank, the subsampling, the conformer layers, the prediction network, LSTM layers or
+Haas-ja's Kimi Delta Attention layers, and the joint, with the SentencePiece pieces the token ids name, the settings of the
 decoding transcribe() runs (greedy TDT's durations and limit, or the beam and length of RNN-T's alignment-length
 synchronous beam search) and, for RNN-T, the limit of the greedy decoding NeMo also runs on it, every other constant the
 C++ reads and the model's identity in the GGUF specification's general keys. A hybrid checkpoint's CTC head is left out,
@@ -14,7 +15,8 @@ Tensor shapes follow ggml, whose ne[0] is the last numpy axis: a Linear weight [
 (ne = [in, out]). Every tensor is written in float32; `speech quantize` makes the other weight types of the file, each
 tensor in the type src/families/fastconformer/layout.cpp gives it. The batch norm of each convolution
 module is folded into its depthwise convolution, which it follows in evaluation, and each LSTM layer's two biases are
-summed. A checkpoint whose conformer layers have no biases (ConformerEncoder's use_bias false) is written without them,
+summed. A tokenizer with byte fallback keeps its byte pieces, <0x00> to <0xFF>, and fastconformer.tokenizer.byte_fallback
+says so. A checkpoint whose conformer layers have no biases (ConformerEncoder's use_bias false) is written without them,
 and fastconformer.encoder.use_bias says so.
 """
 
@@ -33,7 +35,7 @@ from pins import MODELS, restore
 ARCH = "fastconformer"
 # Each layout this converter has written, with the first release of speech.cpp whose reader takes it; it writes the
 # last.
-RELEASES = {1: "0.7.0", 2: "0.8.0"}
+RELEASES = {1: "0.7.0", 2: "0.8.0", 3: "0.8.12"}
 LAYOUT = max(RELEASES)
 # The ISO 639 two-letter codes of the languages each checkpoint transcribes, from its model card, which requests give as
 # BCP 47 tags. None takes a language: parakeet-tdt-0.6b-v3 finds the language of the audio itself.
@@ -42,9 +44,11 @@ LANGUAGES = {
     "reazonspeech-nemo-v2": ["ja"],
     "parakeet-tdt-0.6b-v3": ["en", "es", "fr", "de", "bg", "hr", "cs", "da", "nl", "et", "fi", "el", "hu", "it", "lv",
                              "lt", "mt", "pl", "pt", "ro", "sk", "sl", "sv", "ru", "uk"],
+    "Haas-ja-v1.0": ["ja"],
 }
 # The SPDX identifier of each checkpoint's license, from its model card.
-LICENSES = {"parakeet-tdt_ctc-0.6b-ja": "CC-BY-4.0", "parakeet-tdt-0.6b-v3": "CC-BY-4.0", "reazonspeech-nemo-v2": "Apache-2.0"}
+LICENSES = {"parakeet-tdt_ctc-0.6b-ja": "CC-BY-4.0", "parakeet-tdt-0.6b-v3": "CC-BY-4.0", "reazonspeech-nemo-v2": "Apache-2.0",
+            "Haas-ja-v1.0": "Apache-2.0"}
 # The parts of each model's name under GGUF's naming convention (ggml's docs/gguf.md): its line, its size where the name
 # gives one, what it was trained toward (ja, the language of parakeet-tdt_ctc-0.6b-ja) and its version. Where the name
 # gives no size, the size label is counted from the parameters of the file's tensors.
@@ -52,6 +56,7 @@ NAMES = {
     "parakeet-tdt_ctc-0.6b-ja": {"basename": "parakeet-tdt_ctc", "size_label": "0.6B", "finetune": "ja", "version": None},
     "parakeet-tdt-0.6b-v3": {"basename": "parakeet-tdt", "size_label": "0.6B", "finetune": None, "version": "v3"},
     "reazonspeech-nemo-v2": {"basename": "reazonspeech-nemo", "size_label": None, "finetune": None, "version": "v2"},
+    "Haas-ja-v1.0": {"basename": "Haas", "size_label": None, "finetune": "ja", "version": "v1.0"},
 }
 # speech.cpp's addition to NeMo's segments: the marks that end a segment wherever they stand, for a model whose
 # languages are written without spaces. NeMo ends a segment at one of its separators only where a word ends, which
@@ -128,9 +133,24 @@ else:
     assert isinstance(greedy_max_symbols, int) and greedy_max_symbols > 0, greedy_max_symbols
     durations = []
 assert dec.blank_as_pad and dec.blank_idx == decoding.blank_id and not dec.random_state_sampling
-# LSTMDropout is the plain LSTM rnn() makes without a normalization; its dropout is off in evaluation.
-assert type(dec.prediction.dec_rnn).__name__ == "LSTMDropout" and dec.prediction.dec_rnn.lstm.proj_size == 0
-assert dec.prediction.dec_rnn.lstm.bias and not dec.prediction.dec_rnn.lstm.bidirectional
+# The prediction network: LSTMDropout, the plain LSTM rnn() makes without a normalization, whose dropout is off in
+# evaluation, or Haas-ja's KDAPredictionNetwork, pre-norm residual blocks of fla's KimiDeltaAttention and a final
+# LayerNorm (haas_asr/prednet.py). A step of one label runs KDA's fused_recurrent kernel, whose rule the C++ follows:
+# q and k divided by sqrt(sum of squares + 1e-6) in each head, q scaled by 1/sqrt(head_dim), the decay
+# -exp(A_log) softplus(f + dt_bias) of each key channel and beta = sigmoid(b), on states with the value first.
+dec_rnn = dec.prediction.dec_rnn
+prediction = {"LSTMDropout": "lstm", "KDAPredictionNetwork": "kda"}[type(dec_rnn).__name__]
+if prediction == "lstm":
+    assert dec_rnn.lstm.proj_size == 0 and dec_rnn.lstm.bias and not dec_rnn.lstm.bidirectional
+else:
+    for kda in dec_rnn.layers:
+        assert kda.use_short_conv and not kda.conv_bias and kda.num_v_heads == kda.num_heads and kda.head_v_dim == kda.head_k_dim
+        assert not kda.allow_neg_eigval and not kda.safe_gate and kda.lower_bound is None
+        assert kda.q_conv1d.activation == kda.k_conv1d.activation == kda.v_conv1d.activation == "silu"
+        assert kda.o_norm.activation == "sigmoid" and kda.o_norm.bias is None
+        assert kda.g_proj[1].bias is not None and kda.f_proj[0].bias is None and kda.f_proj[1].bias is None
+    assert all(type(n).__name__ == "LayerNorm" and n.eps == dec_rnn.norms[0].eps for n in dec_rnn.norms)
+    assert dec_rnn.final_norm is not None and dec_rnn.final_norm.eps == dec_rnn.norms[0].eps
 assert not dec.is_adapter_available() and not joint.is_adapter_available()
 assert float(dec.prediction.embed.weight[dec.blank_idx].abs().max()) == 0
 assert joint.activation == "relu" and joint.temperature == 1.0
@@ -186,16 +206,29 @@ tokenizer = model.tokenizer
 assert not tokenizer.legacy
 proto = sentencepiece_model_pb2.ModelProto()
 proto.ParseFromString(tokenizer.tokenizer.serialized_model_proto())
-# Normal, user-defined and unknown pieces only: SentencePiece writes a user-defined piece (parakeet-tdt-0.6b-v3's
-# <|en|> and the other tags) as it writes a normal one, and the C++ detokenizer handles no control or byte pieces.
+# Normal, user-defined, unknown and byte pieces only: SentencePiece writes a user-defined piece (parakeet-tdt-0.6b-v3's
+# <|en|> and the other tags) as it writes a normal one, and the C++ detokenizer handles no control pieces. A byte piece
+# <0xXX>, which byte fallback adds, stands for its byte, and the bytes of consecutive byte pieces are read as UTF-8.
+byte_fallback = bool(proto.trainer_spec.byte_fallback)
 allowed = (proto.SentencePiece.NORMAL, proto.SentencePiece.USER_DEFINED, proto.SentencePiece.UNKNOWN)
+allowed += (proto.SentencePiece.BYTE,) if byte_fallback else ()
 assert all(p.type in allowed for p in proto.pieces)
+assert all(p.piece == f"<0x{i:02X}>" for i, p in enumerate(p for p in proto.pieces if p.type == proto.SentencePiece.BYTE))
 assert not proto.trainer_spec.treat_whitespace_as_suffix
 blank = int(decoding.blank_id)
 assert blank == len(proto.pieces) == tokenizer.vocab_size
 w.add_string("fastconformer.decoder.kind", decoder)
 w.add_uint32("fastconformer.decoder.blank_id", blank)
 w.add_uint32("fastconformer.decoder.prediction_layers", int(dec.pred_rnn_layers))
+w.add_string("fastconformer.decoder.prediction", prediction)
+if prediction == "kda":
+    kda = dec_rnn.layers[0]
+    w.add_uint32("fastconformer.decoder.kda.num_heads", int(kda.num_heads))
+    w.add_uint32("fastconformer.decoder.kda.head_dim", int(kda.head_k_dim))
+    w.add_uint32("fastconformer.decoder.kda.conv_size", int(kda.conv_size))
+    # The eps of the blocks' and the final LayerNorm, and of the RMSNorm of each head's output.
+    w.add_float32("fastconformer.decoder.kda.norm_eps", float(dec_rnn.norms[0].eps))
+    w.add_float32("fastconformer.decoder.kda.output_norm_eps", float(kda.o_norm.eps))
 if decoder == "tdt":
     add_array("fastconformer.decoder.tdt.durations", durations, GGUFValueType.INT32)
     # The most tokens emitted on one frame before the decoding moves to the next.
@@ -219,6 +252,7 @@ w.add_uint32("fastconformer.tokenizer.unknown_id", int(tokenizer.tokenizer.unk_i
 w.add_string("fastconformer.tokenizer.unknown_surface", proto.trainer_spec.unk_surface)
 # Whether SentencePiece's decoder drops the leading "▁" of each piece until the text is no longer empty, which it
 # does when either normalizer option is set.
+w.add_bool("fastconformer.tokenizer.byte_fallback", byte_fallback)
 w.add_bool("fastconformer.tokenizer.strip_leading_space",
            bool(proto.normalizer_spec.add_dummy_prefix or proto.normalizer_spec.remove_extra_whitespaces))
 # The marks before which the decoding removes one whitespace character. The C++ looks for a space only,
@@ -228,8 +262,8 @@ assert not any(c.isspace() for p in proto.pieces for c in p.piece)
 assert all(c == " " or not c.isspace() for c in proto.trainer_spec.unk_surface)
 add_array("fastconformer.tokenizer.punctuation", sorted(decoding.supported_punctuation or []), GGUFValueType.STRING)
 # The decoding strips no language tags from the text (strip_lang_tags, for models that write them), which the C++
-# does not do.
-assert not decoding.strip_lang_tags
+# does not do; NeMo before 3.0, which Haas-ja runs on, has no such option.
+assert not getattr(decoding, "strip_lang_tags", False)
 
 sd = {k: v.detach().float().numpy() for k, v in model.state_dict().items()}
 
@@ -297,13 +331,36 @@ for l in range(int(enc.n_layers)):
     norm("norm_out", o + "out_norm")
 
 # The prediction network: an embedding of the tokens and the blank, then LSTM layers whose gates are stacked as
-# PyTorch stacks them, input, forget, cell and output.
+# PyTorch stacks them, input, forget, cell and output, or KDA blocks: each block's LayerNorm, its projections, its
+# short convolutions' kernels [channels, width], the low-rank projections of the decay and of the output gate, A_log,
+# dt_bias, the RMSNorm of the heads' output and the output projection, then the final LayerNorm.
 add("pred.embed.weight", sd["decoder.prediction.embed.weight"])
 for l in range(int(dec.pred_rnn_layers)):
-    r = "decoder.prediction.dec_rnn.lstm."
-    add(f"pred.lstm.{l}.ih.weight", sd[r + f"weight_ih_l{l}"])
-    add(f"pred.lstm.{l}.hh.weight", sd[r + f"weight_hh_l{l}"])
-    add(f"pred.lstm.{l}.bias", sd[r + f"bias_ih_l{l}"] + sd[r + f"bias_hh_l{l}"])
+    if prediction == "lstm":
+        r = "decoder.prediction.dec_rnn.lstm."
+        add(f"pred.lstm.{l}.ih.weight", sd[r + f"weight_ih_l{l}"])
+        add(f"pred.lstm.{l}.hh.weight", sd[r + f"weight_hh_l{l}"])
+        add(f"pred.lstm.{l}.bias", sd[r + f"bias_ih_l{l}"] + sd[r + f"bias_hh_l{l}"])
+        continue
+    r, o = f"decoder.prediction.dec_rnn.layers.{l}.", f"pred.kda.{l}."
+    add(o + "norm.weight", sd[f"decoder.prediction.dec_rnn.norms.{l}.weight"])
+    add(o + "norm.bias", sd[f"decoder.prediction.dec_rnn.norms.{l}.bias"])
+    for x in ("q", "k", "v"):
+        add(o + f"{x}.weight", sd[r + f"{x}_proj.weight"])
+        add(o + f"{x}_conv.weight", sd[r + f"{x}_conv1d.weight"][:, 0, :])
+    add(o + "f_down.weight", sd[r + "f_proj.0.weight"])
+    add(o + "f_up.weight", sd[r + "f_proj.1.weight"])
+    add(o + "b.weight", sd[r + "b_proj.weight"])
+    add(o + "g_down.weight", sd[r + "g_proj.0.weight"])
+    add(o + "g_up.weight", sd[r + "g_proj.1.weight"])
+    add(o + "g_up.bias", sd[r + "g_proj.1.bias"])
+    add(o + "a_log", sd[r + "A_log"])
+    add(o + "dt_bias", sd[r + "dt_bias"])
+    add(o + "out_norm.weight", sd[r + "o_norm.weight"])
+    add(o + "out.weight", sd[r + "o_proj.weight"])
+if prediction == "kda":
+    add("pred.final_norm.weight", sd["decoder.prediction.dec_rnn.final_norm.weight"])
+    add("pred.final_norm.bias", sd["decoder.prediction.dec_rnn.final_norm.bias"])
 for x in ("enc", "pred"):
     add(f"joint.{x}.weight", sd[f"joint.{x}.weight"])
     add(f"joint.{x}.bias", sd[f"joint.{x}.bias"])

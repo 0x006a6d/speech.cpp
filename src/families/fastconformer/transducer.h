@@ -9,7 +9,11 @@
 
 namespace fastconformer {
 
-/** The LSTM state of the prediction network: h and c, [hidden, layers] each in ggml order. */
+/**
+ * The state of the prediction network, in two parts, each layer's after the one before: an LSTM's h and c, [hidden] a
+ * layer each, or Kimi Delta Attention's recurrent state, [key, value, heads] a layer with the key fastest, and the last
+ * inputs of its short convolutions, [width - 1, channels] a layer for each of q, k and v with the input fastest.
+ */
 struct PredictionState {
     std::vector<float> h, c;
 };
@@ -28,14 +32,16 @@ bool quantized_decoding(const ModelFile & m);
 
 /**
  * NeMo's RNNTDecoder (nemo/collections/asr/modules/rnnt.py) with the blank as the embedding's padding: an
- * embedding of the tokens and the blank, whose blank row is zero, then stacked LSTM layers. One step takes the
- * last label and the state and gives the last layer's h. The blank fed first is the start of the sequence.
+ * embedding of the tokens and the blank, whose blank row is zero, then stacked LSTM layers, or Haas-ja's blocks of
+ * Kimi Delta Attention (haas_asr/prednet.py): a LayerNorm, KDA and the residual each, then a final LayerNorm. One step
+ * takes the last label and the state and gives the last layer's output. The blank fed first is the start of the
+ * sequence.
  */
 class PredictionNetwork {
 public:
     explicit PredictionNetwork(const ModelFile & m);
 
-    /** The tensors of one step: the output [hidden] and the next state, [hidden, layers] each. */
+    /** The tensors of one step: the output [hidden] and the next state, each part flat. */
     struct Step {
         ggml_tensor * output;
         ggml_tensor * h;
@@ -47,7 +53,7 @@ public:
 
     Step build(Graph & g, int32_t label, const PredictionState & state) const;
 
-    /** Builds a step from tensor inputs so that a decoder can reuse its graph for subsequent labels. */
+    /** Builds a step from tensor inputs, each part of the state flat, so that a decoder can reuse its graph for subsequent labels. */
     Step build(Graph & g, ggml_tensor * label, ggml_tensor * h, ggml_tensor * c) const;
 
     /** The next state of a step that has been computed. */
@@ -56,8 +62,16 @@ public:
     int hidden() const { return hidden_; }
 
 private:
+    /** A KDA block on `x`, [hidden], from its layer's recurrent state and convolution inputs, whose next ones it sets. */
+    ggml_tensor * kda(ggml_context * ctx, int layer, ggml_tensor * x, ggml_tensor * h_in, ggml_tensor * c_in, ggml_tensor ** h_out,
+                      ggml_tensor ** c_out) const;
+
     const ModelFile & m_;
     int layers_, hidden_;
+    bool kda_;
+    /** KDA's heads, their width (keys and values alike), the width of its short convolutions and the norms' eps. */
+    int heads_ = 0, head_dim_ = 0, conv_size_ = 0;
+    float norm_eps_ = 0, output_norm_eps_ = 0;
 };
 
 /**

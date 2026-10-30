@@ -8,10 +8,9 @@ DecoderStep::DecoderStep(const PredictionNetwork & prediction, const Joint & joi
     : backend_(backend), allocator_(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend)), ggml_gallocr_free) {
     if (!allocator_) throw Error(Fault::OutOfMemory, "cannot create a graph allocator");
     const auto initial = prediction.initial_state();
-    const int64_t layers = (int64_t) initial.h.size() / prediction.hidden();
     label_ = graph_.input(std::vector<int32_t>{0}, 1);
-    h_ = graph_.input(initial.h, prediction.hidden(), layers);
-    c_ = graph_.input(initial.c, prediction.hidden(), layers);
+    h_ = graph_.input(initial.h, (int64_t) initial.h.size());
+    c_ = graph_.input(initial.c, (int64_t) initial.c.size());
     frames_ = graph_.input(std::vector<float>((size_t) (joint.hidden() * frames)), joint.hidden(), frames);
     step_ = prediction.build(graph_, label_, h_, c_);
     predicted_ = joint.project_prediction(graph_.ctx(), step_.output);
