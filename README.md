@@ -233,6 +233,8 @@ Each model's page has more.
 
 ## License
 
+This is a fork of [nyosegawa/speech.cpp](https://github.com/nyosegawa/speech.cpp), distributed under the MIT License. The original copyright notice and license are kept in [LICENSE](LICENSE): Copyright (c) 2026 Sakasegawa.
+
 MIT, see [LICENSE](LICENSE). The model weights are their authors':
 
 - Qwen3-TTS and Qwen3-ASR are the Qwen team's, under the Apache License 2.0.
