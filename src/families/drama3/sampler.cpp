@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <stdexcept>
 
 #include "error.h"
 
@@ -57,6 +58,67 @@ Candidates candidates(const std::vector<float> & logits, const Sampling & s) {
         c.weights.push_back(p);
     }
     return c;
+}
+
+CodePicks::CodePicks(Graph & g, const Sampling & s, int vocab, int picks)
+    : s_(s), vocab_(vocab), k_(std::min(std::max(s.top_k, 1), vocab)), picks_(picks) {
+    temperature_ = g.input(std::vector<float>{std::max(s.temperature, kMinTemperature)}, 1);
+    // A draw from one candidate reads no number, and an input that no node reads has no memory to upload to.
+    if (k_ > 1) draws_ = g.input(std::vector<float>((size_t) picks, 0.0f), picks);
+    out_ = ggml_new_tensor_2d(g.ctx(), GGML_TYPE_F32, picks, 3);
+    g.output(out_);
+}
+
+ggml_tensor * CodePicks::pick(Graph & g, int i, ggml_tensor * logits) {
+    ggml_context * ctx = g.ctx();
+    const auto slot = [&](int row) { return ggml_view_1d(ctx, out_, 1, (size_t) (row * picks_ + i) * out_->nb[0]); };
+    // The sum of the logits is finite only where every logit is, which read() checks after the compute.
+    g.copy(ggml_sum(ctx, logits), slot(2));
+    ggml_tensor * scaled = ggml_reshape_2d(ctx, ggml_div(ctx, logits, temperature_), vocab_, 1);
+    ggml_tensor * order = ggml_argsort_top_k(ctx, scaled, k_);
+    ggml_tensor * largest = ggml_get_rows(ctx, ggml_reshape_2d(ctx, scaled, 1, vocab_), ggml_view_1d(ctx, order, 1, 0));
+    g.copy(ggml_reshape_1d(ctx, largest, 1), slot(1));
+    if (k_ == 1) {
+        g.copy(order, slot(0));
+        return order;
+    }
+    // The softmax reads the logits less the largest, which no temperature takes to +inf: an infinite scaled logit makes
+    // ggml's softmax assert that its sum is positive.
+    ggml_tensor * probabilities = ggml_soft_max(ctx, ggml_sub(ctx, scaled, ggml_reshape_2d(ctx, largest, 1, 1)));
+    ggml_tensor * cumulative = ggml_cumsum(ctx, ggml_reshape_1d(ctx, ggml_get_rows(ctx, ggml_reshape_2d(ctx, probabilities, 1, vocab_), order), k_));
+    // The candidates after the first whose cumulative probability is below top_p are kept, so the last kept is their
+    // count; the pick is the last kept less the candidates before it whose cumulative probability passes the threshold,
+    // as the cumulative probabilities do not fall. Counted with sums of steps, it takes no comparison of indices, which
+    // ggml lacks, and the counts are clamped so that logits that are not numbers read no row outside the candidates.
+    ggml_tensor * before_last = ggml_view_1d(ctx, cumulative, k_ - 1, 0);
+    ggml_tensor * after_first = ggml_view_1d(ctx, cumulative, k_ - 1, cumulative->nb[0]);
+    ggml_tensor * kept = ggml_step(ctx, ggml_scale_bias(ctx, after_first, -1.0f, s_.top_p));
+    ggml_tensor * last = ggml_clamp(ctx, ggml_sum(ctx, kept), 0.0f, (float) (k_ - 1));
+    ggml_tensor * u = ggml_view_1d(ctx, draws_, 1, (size_t) i * draws_->nb[0]);
+    ggml_tensor * threshold = ggml_mul(ctx, ggml_reshape_1d(ctx, ggml_get_rows(ctx, ggml_reshape_2d(ctx, cumulative, 1, k_), ggml_cast(ctx, last, GGML_TYPE_I32)), 1), u);
+    ggml_tensor * passing = ggml_mul(ctx, ggml_step(ctx, ggml_sub(ctx, before_last, threshold)), kept);
+    ggml_tensor * index = ggml_clamp(ctx, ggml_sub(ctx, last, ggml_sum(ctx, passing)), 0.0f, (float) (k_ - 1));
+    ggml_tensor * id = ggml_reshape_1d(ctx, ggml_get_rows(ctx, ggml_view_2d(ctx, order, 1, k_, order->nb[0], 0), ggml_cast(ctx, index, GGML_TYPE_I32)), 1);
+    g.copy(id, slot(0));
+    return id;
+}
+
+void CodePicks::draw(Graph & g, const std::vector<double> & u) const {
+    if ((int) u.size() != picks_) throw std::logic_error("picks in a graph were given another count of numbers to draw with");
+    if (draws_) g.set(draws_, std::vector<float>(u.begin(), u.end()));
+}
+
+std::vector<int32_t> CodePicks::read() const {
+    const std::vector<float> out = Graph::read(out_);
+    std::vector<int32_t> codes((size_t) picks_);
+    for (int i = 0; i < picks_; i++) {
+        if (!std::isfinite(out[(size_t) (2 * picks_ + i)])) {
+            throw Error(Fault::Device, "the device computed logits that are not finite numbers; run the model on another device or with another weight type");
+        }
+        if (!std::isfinite(out[(size_t) (picks_ + i)])) throw temperature_overflow(s_.temperature);
+        codes[(size_t) i] = (int32_t) out[(size_t) i];
+    }
+    return codes;
 }
 
 FrameSampler::FrameSampler(const ModelFile & m, const Sampling & request)

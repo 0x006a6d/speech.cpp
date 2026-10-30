@@ -1,6 +1,7 @@
 #include "audio-decoder.h"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -15,6 +16,8 @@ namespace {
  * 268 MB for a block of the longest prompt, 8,192 rows of 16 heads.
  */
 constexpr int64_t kBlockRows = 512;
+/** The rows the attention of a frame's graph reads come in multiples of this, so that the graph serves the next frames. */
+constexpr int64_t kFrameRows = 64;
 
 std::string layer_name(int l, int shared) {
     return l < shared ? "ad.shared." + std::to_string(l) + "." : "ad.layer." + std::to_string(l - shared) + ".";
@@ -31,6 +34,27 @@ struct AudioDecoder::Rows {
     ggml_tensor * audio = nullptr;
     /** The summed embeddings of the row's own codes that the text model did not see, [dim, n]. */
     ggml_tensor * unseen = nullptr;
+    /** The inputs of the unseen embeddings: their ids, and 1 where the row's main token is semantic. */
+    ggml_tensor * unseen_ids = nullptr, * own = nullptr;
+    /** The row a frame's graph writes, I32 [1], and the rows it reads; none for a prefill's or a step's rows. */
+    ggml_tensor * row = nullptr;
+    int64_t n_kv = 0;
+};
+
+/**
+ * The graph of a frame, its layers and the picks of its codes, which the frames after it compute again while their
+ * attention reads the same rows: it reads the rows up to a multiple of kFrameRows, which the mask hides past the
+ * sequence, and writes its row where an input says. A graph for each layer read its output and the code's logits back
+ * and drew the code on the CPU: 9 graphs a frame, 9.4 ms of a frame's 21 ms on an RTX 5090 (2026-10-30).
+ */
+struct AudioDecoder::Frame {
+    Graph graph;
+    const KeysValues * cache = nullptr;
+    int64_t n_kv = 0;
+    bool computes = false;
+    Rows rows;
+    ggml_tensor * hidden = nullptr, * first = nullptr;
+    std::unique_ptr<CodePicks> picks;
 };
 
 AudioDecoder::AudioDecoder(const ModelFile & m, ggml_backend_t backend) : backend_(backend), m_(m) {
@@ -52,11 +76,15 @@ AudioDecoder::AudioDecoder(const ModelFile & m, ggml_backend_t backend) : backen
 }
 
 AudioDecoder::~AudioDecoder() {
+    frame_.reset();
+    if (frame_allocr_) ggml_gallocr_free(frame_allocr_);
     if (allocr_) ggml_gallocr_free(allocr_);
 }
 
 void AudioDecoder::start(int64_t rows) {
     if (!cache_ || cache_->capacity() < rows) {
+        // The kept frame reads the cache it was built on.
+        frame_.reset();
         cache_.reset();
         cache_ = std::make_unique<KeysValues>(backend_, layers(), head_dim_, kv_heads_, rows);
     }
@@ -87,7 +115,8 @@ ggml_tensor * AudioDecoder::layer(Graph & g, int l, ggml_tensor * hidden, ggml_t
     q = ggml_rope_ext(c, norm(q, "attn_q_norm"), r.positions, nullptr, rotary_dim_, GGML_ROPE_TYPE_NORMAL, 0, rope_base_, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     k = ggml_rope_ext(c, norm(k, "attn_k_norm"), r.positions, nullptr, rotary_dim_, GGML_ROPE_TYPE_NORMAL, 0, rope_base_, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-    ggml_tensor * o = ggml_mul(c, cache_->attend(g, l, q, k, v, r.first, r.mask), gate);
+    ggml_tensor * attended = r.row ? cache_->attend_row(g, l, q, k, v, r.row, r.n_kv, r.mask) : cache_->attend(g, l, q, k, v, r.first, r.mask);
+    ggml_tensor * o = ggml_mul(c, attended, gate);
     x = ggml_add(c, x, mul_mat(c, m_.tensor(p + "attn_output"), o));
 
     h = norm(x, "ffn_norm");
@@ -105,9 +134,28 @@ AudioDecoder::Rows AudioDecoder::rows(Graph & g, int64_t n, const int32_t * fram
     r.audio = g.input(audio, 1, n);
     if (!unseen) return r;
 
-    const int width = 1 + codebooks_;
     std::vector<int32_t> ids;
-    std::vector<float> own((size_t) n);
+    std::vector<float> own;
+    unseen_ids(frames, n, ids, own);
+    if (!ids.empty()) {
+        ggml_context * c = g.ctx();
+        r.unseen_ids = g.input(ids, (int64_t) ids.size());
+        ggml_tensor * e = ggml_get_rows(c, m_.tensor("ad.codebook_embd"), r.unseen_ids);
+        ggml_tensor * sum = nullptr;
+        for (int64_t j = 0; j < (int64_t) ids.size() / n; j++) {
+            ggml_tensor * part = ggml_view_2d(c, e, d_, n, e->nb[1], (size_t) (j * n) * e->nb[1]);
+            sum = sum ? ggml_add(c, sum, part) : part;
+        }
+        r.own = g.input(own, 1, n);
+        r.unseen = ggml_mul(c, sum, r.own);
+    }
+    return r;
+}
+
+void AudioDecoder::unseen_ids(const int32_t * frames, int64_t n, std::vector<int32_t> & ids, std::vector<float> & own) const {
+    const int width = 1 + codebooks_;
+    ids.clear();
+    own.assign((size_t) n, 0.0f);
     for (int64_t i = 0; i < n; i++) own[(size_t) i] = semantic(frames[i * width]) ? 1.0f : 0.0f;
     // The file holds the embeddings of codebooks 1 to 9, codebook b's from row (b - 1) * vocab_size.
     for (int b = 1 + seen_; b < codebooks_; b++) {
@@ -117,17 +165,6 @@ AudioDecoder::Rows AudioDecoder::rows(Graph & g, int64_t n, const int32_t * fram
             ids.push_back((b - 1) * vocab_ + code);
         }
     }
-    if (!ids.empty()) {
-        ggml_context * c = g.ctx();
-        ggml_tensor * e = ggml_get_rows(c, m_.tensor("ad.codebook_embd"), g.input(ids, (int64_t) ids.size()));
-        ggml_tensor * sum = nullptr;
-        for (int64_t j = 0; j < (int64_t) ids.size() / n; j++) {
-            ggml_tensor * part = ggml_view_2d(c, e, d_, n, e->nb[1], (size_t) (j * n) * e->nb[1]);
-            sum = sum ? ggml_add(c, sum, part) : part;
-        }
-        r.unseen = ggml_mul(c, sum, g.input(own, 1, n));
-    }
-    return r;
 }
 
 void AudioDecoder::prefill(const std::vector<float> & hidden, const std::vector<int32_t> & frames, int64_t n,
@@ -186,7 +223,20 @@ void AudioDecoder::reserve(int64_t rows, int64_t prompt_rows) {
     const std::vector<int32_t> frames((size_t) ((block + 1) * (1 + codebooks_)), 0);
     Graph g;
     build_prefill(g, g.zeros(d_, block), frames.data(), nullptr);
-    if (!ggml_gallocr_reserve(allocr_, g.cgraph())) {
+    bool reserved = ggml_gallocr_reserve(allocr_, g.cgraph());
+    // The graph of a frame that reads every row of the sequence and draws from every code, the largest a frame builds.
+    if (reserved) {
+        frame_.reset();
+        n_past_ = 0;
+        Sampling widest;
+        widest.top_k = vocab_;
+        widest.top_p = 0.5f;
+        const std::unique_ptr<Frame> largest =
+            build_frame(std::vector<float>((size_t) d_, 0.0f), std::vector<int32_t>((size_t) (1 + codebooks_), 0), semantic_begin_, widest,
+                        cache_->capacity());
+        reserved = !largest->computes || ggml_gallocr_reserve(frame_allocr_, largest->graph.cgraph());
+    }
+    if (!reserved) {
         throw Error(Fault::OutOfMemory, "cannot reserve the memory of the audio decoder's graphs on " + std::string(ggml_backend_name(backend_)));
     }
     start(rows);
@@ -226,6 +276,91 @@ std::vector<int32_t> AudioDecoder::step(const std::vector<float> & hidden, const
     }
     n_past_++;
     return codes;
+}
+
+std::unique_ptr<AudioDecoder::Frame> AudioDecoder::build_frame(const std::vector<float> & hidden, const std::vector<int32_t> & frame,
+                                                                int32_t main, const Sampling & s, int64_t n_kv) {
+    if (!frame_allocr_) frame_allocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+    auto f = std::make_unique<Frame>();
+    Graph & g = f->graph;
+    f->cache = cache_.get();
+    f->n_kv = n_kv;
+    f->hidden = g.input(hidden, d_, 1);
+    Rows & r = f->rows;
+    r = rows(g, 1, frame.data(), {semantic(main) ? 1.0f : 0.0f}, true);
+    r.row = g.input(std::vector<int32_t>{(int32_t) n_past_}, 1);
+    r.n_kv = n_kv;
+    r.mask = g.input(frame_mask(n_kv), n_kv, 1);
+    f->first = g.input(std::vector<int32_t>{std::clamp(main - semantic_begin_, 0, vocab_ - 1)}, 1);
+    f->picks = std::make_unique<CodePicks>(g, s, vocab_, codebooks_ - 1);
+    ggml_tensor * x = f->hidden, * code = f->first;
+    for (int l = 0; l < layers(); l++) {
+        // The shared layers mix in the frame's first code, and the layer of residual codebook b the code drawn before.
+        x = layer(g, l, x, code, r);
+        if (l >= shared_) {
+            const int b = l - shared_;
+            code = f->picks->pick(g, b, mul_mat(g.ctx(), m_.tensor("ad.head." + std::to_string(b)), x));
+        }
+    }
+    ggml_cgraph * gf = g.cgraph();
+    f->computes = true;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) f->computes &= ggml_backend_supports_op(backend_, ggml_graph_node(gf, i));
+    return f;
+}
+
+std::vector<float> AudioDecoder::frame_mask(int64_t n_kv) const {
+    std::vector<float> mask((size_t) n_kv);
+    for (int64_t j = 0; j < n_kv; j++) mask[(size_t) j] = j <= n_past_ ? 0.0f : -INFINITY;
+    return mask;
+}
+
+bool AudioDecoder::step_in_graph(const std::vector<float> & hidden, const std::vector<int32_t> & frame, int32_t main, const Sampling & s,
+                                 const std::vector<double> & draws, std::vector<int32_t> & codes) {
+    if ((int64_t) hidden.size() != d_ || (int64_t) frame.size() != 1 + codebooks_) {
+        throw std::invalid_argument("the audio decoder's step takes the state and the frame of one row");
+    }
+    if (!cache_ || n_past_ + 1 > cache_->capacity()) throw std::invalid_argument("the audio decoder's rows outgrow the sequence it was started for");
+    const int64_t n_kv = std::min(cache_->capacity(), (n_past_ / kFrameRows + 1) * kFrameRows);
+    const auto same = [](const Sampling & a, const Sampling & b) { return a.temperature == b.temperature && a.top_k == b.top_k && a.top_p == b.top_p; };
+    Frame * f = frame_.get();
+    if (f && f->cache == cache_.get() && f->n_kv == n_kv && same(f->picks->sampling(), s)) {
+        if (!f->computes) return false;
+        Graph & g = f->graph;
+        const std::vector<int32_t> row = {(int32_t) n_past_};
+        std::vector<int32_t> ids;
+        std::vector<float> own;
+        unseen_ids(frame.data(), 1, ids, own);
+        g.set(f->hidden, hidden);
+        g.set(f->rows.positions, row);
+        g.set(f->rows.row, row);
+        g.set(f->rows.mask, frame_mask(n_kv));
+        g.set(f->rows.audio, std::vector<float>{semantic(main) ? 1.0f : 0.0f});
+        if (f->rows.unseen_ids) {
+            g.set(f->rows.unseen_ids, ids);
+            g.set(f->rows.own, own);
+        }
+        g.set(f->first, std::vector<int32_t>{std::clamp(main - semantic_begin_, 0, vocab_ - 1)});
+        f->picks->draw(g, draws);
+        g.compute_again(backend_);
+    } else {
+        // The frame is kept only once it has computed: a graph whose memory could not be allocated has tensors without
+        // memory, which computing it again would write to and abort.
+        frame_.reset();
+        std::unique_ptr<Frame> built = build_frame(hidden, frame, main, s, n_kv);
+        f = built.get();
+        if (!f->computes) {
+            frame_ = std::move(built);
+            return false;
+        }
+        f->picks->draw(f->graph, draws);
+        f->graph.compute(backend_, frame_allocr_);
+        frame_ = std::move(built);
+    }
+    const std::vector<int32_t> picked = f->picks->read();
+    codes = {std::clamp(main - semantic_begin_, 0, vocab_ - 1)};
+    codes.insert(codes.end(), picked.begin(), picked.end());
+    n_past_++;
+    return true;
 }
 
 }  // namespace drama3

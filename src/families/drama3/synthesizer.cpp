@@ -110,9 +110,15 @@ Synthesizer::Chunk Synthesizer::speak(const std::vector<int32_t> & rows, int64_t
             chunk.ended = true;
             break;
         }
-        const std::vector<int32_t> codes = decoder_.step(last, frame, main, [&](int, const std::vector<float> & logits) {
-            return sampler.code(logits, uniform(rng));
-        });
+        // The codes draw their numbers in the order of the codebooks, whichever graph draws them.
+        std::vector<double> draws;
+        for (int b = 1; b < codebooks; b++) draws.push_back(uniform(rng));
+        std::vector<int32_t> codes;
+        if (!decoder_.step_in_graph(last, frame, main, sampler.request(), draws, codes)) {
+            codes = decoder_.step(last, frame, main, [&](int codebook, const std::vector<float> & logits) {
+                return sampler.code(logits, draws[(size_t) (codebook - 1)]);
+            });
+        }
         frame.assign(1, main);
         frame.insert(frame.end(), codes.begin(), codes.end());
         mains.push_back(main);

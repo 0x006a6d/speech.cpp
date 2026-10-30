@@ -15,6 +15,8 @@ namespace {
  * for a block of the longest prompt, 8,192 rows of 16 heads.
  */
 constexpr int64_t kBlockRows = 512;
+/** The rows the attention of a step reads come in multiples of this, so that the graph of a step serves the next ones. */
+constexpr int64_t kStepRows = 64;
 /** The epsilon of the official l2norm() of the Gated DeltaNet's queries and keys: x * rsqrt(sum(x^2) + 1e-6). */
 constexpr float kL2Eps = 1e-6f;
 
@@ -98,6 +100,8 @@ TextModel::TextModel(const ModelFile & m, ggml_backend_t backend, int first, int
 }
 
 TextModel::~TextModel() {
+    step_.reset();
+    if (step_allocr_) ggml_gallocr_free(step_allocr_);
     if (sched_) ggml_backend_sched_free(sched_);
     if (allocr_) ggml_gallocr_free(allocr_);
 }
@@ -105,6 +109,8 @@ TextModel::~TextModel() {
 void TextModel::start(int64_t rows) {
     const int attention_layers = (int) std::count(types_.begin() + first_, types_.begin() + last_, true);
     if (attention_layers > 0 && (!keys_values_ || keys_values_->capacity() < rows)) {
+        // The kept step reads the cache it was built on.
+        step_.reset();
         keys_values_.reset();
         keys_values_ = std::make_unique<KeysValues>(backend_, attention_layers, head_dim_, kv_heads_, rows);
     }
@@ -131,7 +137,8 @@ void TextModel::rewind(int64_t rows) {
     n_past_ = rows;
 }
 
-ggml_tensor * TextModel::attention_mixer(Graph & g, int l, ggml_tensor * x, int64_t first, ggml_tensor * pos, ggml_tensor * mask) {
+ggml_tensor * TextModel::attention_mixer(Graph & g, int l, ggml_tensor * x, const Attending & at) {
+    ggml_tensor * pos = at.pos;
     ggml_context * c = g.ctx();
     const std::string p = layer_name(l);
     const int64_t n = x->ne[1];
@@ -143,7 +150,10 @@ ggml_tensor * TextModel::attention_mixer(Graph & g, int l, ggml_tensor * x, int6
     // RoPE turns the first rotary_dim channels of each head in two halves, ggml's NeoX mode.
     q = ggml_rope_ext(c, norm(q, "attn_q_norm"), pos, nullptr, rotary_dim_, GGML_ROPE_TYPE_NEOX, 0, rope_theta_, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     k = ggml_rope_ext(c, norm(k, "attn_k_norm"), pos, nullptr, rotary_dim_, GGML_ROPE_TYPE_NEOX, 0, rope_theta_, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    ggml_tensor * o = ggml_mul(c, keys_values_->attend(g, slot_[(size_t) l], q, k, v, first, mask), gate);
+    const int slot = slot_[(size_t) l];
+    ggml_tensor * attended = at.row ? keys_values_->attend_row(g, slot, q, k, v, at.row, at.n_kv, at.mask)
+                                    : keys_values_->attend(g, slot, q, k, v, at.first, at.mask);
+    ggml_tensor * o = ggml_mul(c, attended, gate);
     return mul_mat(c, m_.tensor(p + "attn_output"), o);
 }
 
@@ -261,9 +271,68 @@ ggml_tensor * TextModel::build_embed(Graph & g, const std::vector<int32_t> & fra
     return e;
 }
 
+/**
+ * The graph of a step of one row, which the steps after it compute again while their attention reads the same rows,
+ * their input, position, mask and row given anew: attention reads the rows up to a multiple of kStepRows, which the
+ * mask hides past the sequence, and writes its row where an input says. On CUDA with its graphs, ggml captures a
+ * graph that is computed again and launches the capture for the steps after it, where a graph built anew for each
+ * step was never captured and launched its 3,632 nodes a kernel at a time: a frame's step of the text model took
+ * 26.5 ms so on an RTX 5090 (2026-10-30). Its memory comes from an allocator of the steps alone, so that no other
+ * graph moves its tensors, and which the next step's graph reuses: memory taken anew for each graph took 130 ms on
+ * that GPU under WSL 2.
+ */
+struct TextModel::Step {
+    Graph graph;
+    const KeysValues * keys_values = nullptr;
+    Attending at;
+    ggml_tensor * x = nullptr, * out = nullptr;
+};
+
+std::unique_ptr<TextModel::Step> TextModel::build_step(const std::vector<float> & x, int64_t n_kv, const std::vector<int32_t> & pos,
+                                                       const std::vector<float> & mask) {
+    if (!step_allocr_) step_allocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+    auto s = std::make_unique<Step>();
+    s->keys_values = keys_values_.get();
+    s->x = s->graph.input(x, h_, 1);
+    s->at.first = n_past_;
+    s->at.pos = s->graph.input(pos, 1);
+    s->at.row = s->graph.input(pos, 1);
+    s->at.n_kv = n_kv;
+    s->at.mask = s->graph.input(mask, n_kv, 1);
+    s->out = build_rows(s->graph, s->x, nullptr, &s->at);
+    return s;
+}
+
+std::vector<float> TextModel::step(const std::vector<float> & x) {
+    const int64_t n_kv = std::min(capacity_, (n_past_ / kStepRows + 1) * kStepRows);
+    std::vector<float> mask((size_t) n_kv);
+    for (int64_t j = 0; j < n_kv; j++) mask[(size_t) j] = j <= n_past_ ? 0.0f : -INFINITY;
+    const std::vector<int32_t> pos = {(int32_t) n_past_};
+    Step * s = step_.get();
+    if (s && s->keys_values == keys_values_.get() && s->at.n_kv == n_kv) {
+        s->graph.set(s->x, x);
+        s->graph.set(s->at.pos, pos);
+        s->graph.set(s->at.row, pos);
+        s->graph.set(s->at.mask, mask);
+        s->graph.compute_again(backend_);
+    } else {
+        // The step is kept only once it has computed: a graph whose memory could not be allocated has tensors without
+        // memory, which computing it again would write to and abort.
+        step_.reset();
+        std::unique_ptr<Step> built = build_step(x, n_kv, pos, mask);
+        s = built.get();
+        s->graph.compute(backend_, step_allocr_);
+        step_ = std::move(built);
+    }
+    n_past_ += 1;
+    return Graph::read(s->out);
+}
+
 std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, TextModelStages * stages) {
     if (n < 1 || (int64_t) input.size() != n * h_) throw std::invalid_argument("the text model takes an input of each row");
     if (n_past_ + n > capacity_) throw std::invalid_argument("the text model's rows outgrow the sequence it was started for");
+    // The scheduler places a graph's nodes on the CPU and the device each time it computes, which a kept graph skips.
+    if (n == 1 && !stages && !sched_ && keys_values_) return step(input);
     const int count = last_ - first_;
     if (stages) {
         for (auto * s : {&stages->mixer, &stages->router, &stages->moe, &stages->layers}) s->assign((size_t) count, {});
@@ -295,17 +364,23 @@ std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, T
     return out;
 }
 
-ggml_tensor * TextModel::build_rows(Graph & g, ggml_tensor * x, std::vector<std::vector<ggml_tensor *>> * kept) {
+ggml_tensor * TextModel::build_rows(Graph & g, ggml_tensor * x, std::vector<std::vector<ggml_tensor *>> * kept, const Attending * step) {
     ggml_context * c = g.ctx();
     const int64_t rows = x->ne[1];
-    // A graph holds only the inputs its nodes read, and only attention reads the positions and the mask.
-    const bool attends = std::count(types_.begin() + first_, types_.begin() + last_, true) > 0;
-    ggml_tensor * pos = attends ? positions(g, n_past_, rows) : nullptr;
-    ggml_tensor * mask = attends ? causal_mask(g, n_past_, rows) : nullptr;
+    Attending at;
+    if (step) {
+        at = *step;
+    } else {
+        // A graph holds only the inputs its nodes read, and only attention reads the positions and the mask.
+        const bool attends = std::count(types_.begin() + first_, types_.begin() + last_, true) > 0;
+        at.first = n_past_;
+        at.pos = attends ? positions(g, n_past_, rows) : nullptr;
+        at.mask = attends ? causal_mask(g, n_past_, rows) : nullptr;
+    }
     for (int l = first_; l < last_; l++) {
         const std::string p = layer_name(l);
         ggml_tensor * h = ggml_mul(c, ggml_rms_norm(c, x, eps_), m_.tensor(p + "attn_norm"));
-        ggml_tensor * mixer = attention(l) ? attention_mixer(g, l, h, n_past_, pos, mask) : delta_mixer(g, l, h);
+        ggml_tensor * mixer = attention(l) ? attention_mixer(g, l, h, at) : delta_mixer(g, l, h);
         x = ggml_add(c, x, mixer);
         ggml_tensor * router = nullptr;
         ggml_tensor * moe = experts(g, l, ggml_mul(c, ggml_rms_norm(c, x, eps_), m_.tensor(p + "post_attn_norm")), &router);
@@ -333,8 +408,14 @@ void TextModel::reserve(int64_t rows, int64_t prompt_rows) {
     Graph rows_graph;
     build_rows(rows_graph, rows_graph.zeros(h_, block), nullptr);
     // The embeddings compute on the model's device alone, and the layers through the scheduler where it has one.
-    const bool reserved = ggml_gallocr_reserve(allocr_, embedding.cgraph()) &&
-                          (sched_ ? ggml_backend_sched_reserve(sched_, rows_graph.cgraph()) : ggml_gallocr_reserve(allocr_, rows_graph.cgraph()));
+    bool reserved = ggml_gallocr_reserve(allocr_, embedding.cgraph()) &&
+                    (sched_ ? ggml_backend_sched_reserve(sched_, rows_graph.cgraph()) : ggml_gallocr_reserve(allocr_, rows_graph.cgraph()));
+    // The graph of a step that reads every row of the sequence, the largest a step builds, where run() keeps steps.
+    if (reserved && !sched_ && keys_values_) {
+        step_.reset();
+        const std::unique_ptr<Step> largest = build_step(std::vector<float>((size_t) h_, 0.0f), rows, {0}, std::vector<float>((size_t) rows, 0.0f));
+        reserved = ggml_gallocr_reserve(step_allocr_, largest->graph.cgraph());
+    }
     if (!reserved) throw Error(Fault::OutOfMemory, "cannot reserve the memory of the text model's graphs on " + std::string(ggml_backend_name(backend_)));
     start(rows);
 }

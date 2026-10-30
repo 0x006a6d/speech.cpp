@@ -94,8 +94,18 @@ public:
 
 private:
     struct States;
+    struct Step;
 
-    ggml_tensor * attention_mixer(Graph & g, int l, ggml_tensor * x, int64_t first, ggml_tensor * pos, ggml_tensor * mask);
+    /** Where the attention of a graph writes and reads: after `first` rows, or, with a `row` input, a step's. */
+    struct Attending {
+        int64_t first = 0;
+        ggml_tensor * pos = nullptr, * mask = nullptr;
+        /** The row a step writes, I32 [1], and the rows it reads; none for a run's rows. */
+        ggml_tensor * row = nullptr;
+        int64_t n_kv = 0;
+    };
+
+    ggml_tensor * attention_mixer(Graph & g, int l, ggml_tensor * x, const Attending & at);
     ggml_tensor * delta_mixer(Graph & g, int l, ggml_tensor * x);
     /** The graph of the embeddings of `n` frames, which embed() computes. */
     ggml_tensor * build_embed(Graph & g, const std::vector<int32_t> & frames, int64_t n);
@@ -103,7 +113,11 @@ private:
      * The graph of the layers on the rows of `x`, [hidden, rows], after n_past(), and the final norm where the run
      * ends with the model's last layer; `kept`, when given, receives each layer's mixer, router, experts and output.
      */
-    ggml_tensor * build_rows(Graph & g, ggml_tensor * x, std::vector<std::vector<ggml_tensor *>> * kept);
+    ggml_tensor * build_rows(Graph & g, ggml_tensor * x, std::vector<std::vector<ggml_tensor *>> * kept, const Attending * step = nullptr);
+    /** run() of one row in the graph of a step, which is kept for the steps after it. */
+    std::vector<float> step(const std::vector<float> & x);
+    /** Builds the graph of a step on the row `x` that reads `n_kv` rows, with its position and mask. */
+    std::unique_ptr<Step> build_step(const std::vector<float> & x, int64_t n_kv, const std::vector<int32_t> & pos, const std::vector<float> & mask);
     /** The experts and the shared expert on `x`, and the router's logits in `router`. */
     ggml_tensor * experts(Graph & g, int l, ggml_tensor * x, ggml_tensor ** router);
 
@@ -128,6 +142,9 @@ private:
      * and the rows run when it was made.
      */
     std::unique_ptr<States> kept_;
+    std::unique_ptr<Step> step_;
+    /** The allocator of the steps' graphs, one at a time. */
+    ggml_gallocr_t step_allocr_ = nullptr;
     int64_t kept_rows_ = -1;
     /** The index of each layer among the attention layers or the Gated DeltaNet layers of the run. */
     std::vector<int> slot_;

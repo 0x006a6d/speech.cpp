@@ -28,7 +28,18 @@ public:
      */
     ggml_tensor * attend(Graph & g, int l, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, int64_t first, ggml_tensor * mask) const;
 
+    /**
+     * attend() for one row, written at the row that the input `row`, I32 [1], gives and attending to the rows
+     * [0, n_kv) under `mask`, [n_kv, 1], which hides the rows past it: the graph of a step serves the steps after it
+     * while they fall in the same n_kv.
+     */
+    ggml_tensor * attend_row(Graph & g, int l, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, ggml_tensor * row, int64_t n_kv,
+                             ggml_tensor * mask) const;
+
 private:
+    /** The attention of `q` over `keys` and `values` under `mask`, as attend() builds it. */
+    static ggml_tensor * scores(ggml_context * c, ggml_tensor * q, ggml_tensor * keys, ggml_tensor * values, ggml_tensor * mask);
+
     ggml_context * ctx_ = nullptr;
     ggml_backend_buffer_t buffer_ = nullptr;
     std::vector<ggml_tensor *> k_, v_;

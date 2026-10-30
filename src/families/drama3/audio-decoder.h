@@ -10,6 +10,7 @@
 #include "ggml-backend.h"
 #include "graph.h"
 #include "model-file.h"
+#include "sampler.h"
 
 namespace drama3 {
 
@@ -69,7 +70,23 @@ public:
     std::vector<int32_t> step(const std::vector<float> & hidden, const std::vector<int32_t> & frame, int32_t main,
                               const ChooseCode & choose, std::vector<std::vector<float>> * outputs = nullptr);
 
+    /**
+     * step() with every code after the first drawn on the device as CodePicks draws it under `s` by `draws`, one number
+     * of uniform() for each in the order of the codebooks, in one graph that is kept for the frames after it while they
+     * read the same rows. Returns false, having run nothing, where the device cannot compute an operation of the graph.
+     */
+    bool step_in_graph(const std::vector<float> & hidden, const std::vector<int32_t> & frame, int32_t main, const Sampling & s,
+                       const std::vector<double> & draws, std::vector<int32_t> & codes);
+
 private:
+    struct Frame;
+    /** Builds the graph of a frame after the row of n_past(), as step_in_graph() describes it, reading `n_kv` rows. */
+    std::unique_ptr<Frame> build_frame(const std::vector<float> & hidden, const std::vector<int32_t> & frame, int32_t main, const Sampling & s,
+                                       int64_t n_kv);
+    /** The mask of the row of n_past() over `n_kv` rows, which hides the rows after it. */
+    std::vector<float> frame_mask(int64_t n_kv) const;
+    /** The ids of the unseen codes' embeddings of `n` frames and whether each frame's main token is semantic, as rows() reads them. */
+    void unseen_ids(const int32_t * frames, int64_t n, std::vector<int32_t> & ids, std::vector<float> & own) const;
     /**
      * The graph of the prompt's rows of `x`, [dim, rows], after n_past(), whose frames and the one after the last start
      * at `own`; `kept`, when given, receives each layer's output.
@@ -96,6 +113,9 @@ private:
     float eps_ = 0, rope_base_ = 0;
     int32_t semantic_begin_ = 0, semantic_end_ = 0;
     std::unique_ptr<KeysValues> cache_;
+    std::unique_ptr<Frame> frame_;
+    /** The allocator of the frames' graphs, one at a time. */
+    ggml_gallocr_t frame_allocr_ = nullptr;
     int64_t n_past_ = 0;
 };
 
