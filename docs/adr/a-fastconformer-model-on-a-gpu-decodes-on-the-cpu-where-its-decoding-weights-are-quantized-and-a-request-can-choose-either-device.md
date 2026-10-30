@@ -29,7 +29,17 @@ of a file: 11.5 MB of reazonspeech-nemo-v2's Q8_0 file, 11.6 MB of parakeet-tdt_
 parakeet-tdt-0.6b-v3's F16 file, the files the names fetch. In the Q6_K, Q5_K and Q4_K files they are Q8_0.
 
 ggml's CPU backend, built without OpenMP as every release is, starts and joins its threads for every graph unless it is
-given a pool of its own.
+given a pool of its own, and after each node of a graph every thread waits for the others. A step's nodes are small:
+35 that compute for parakeet-tdt_ctc-0.6b-ja's LSTM and 105 for Haas-ja-v1.0's Kimi Delta Attention, of vectors of 320
+to 640. On a Ryzen 9 9950X3D (16 cores) with the model on an RTX 5090, the median microseconds of one step at 4, 8 and 16
+threads, of 21 decodings of a FLEURS utterance, measured on 2026-10-31:
+
+| Step | Weights | 4, 8, 16 threads |
+|---|---|---|
+| Haas-ja-v1.0 (KDA) | Q8_0 | 122, 165, 205 |
+| parakeet-tdt_ctc-0.6b-ja | Q8_0 | 91, 90, 105 |
+| reazonspeech-nemo-v2, beam of 4 | Q8_0 | 271, 248, 283 |
+| parakeet-tdt-0.6b-v3 | F16 | 99, 79, 82 |
 
 ## Decision
 
@@ -42,8 +52,10 @@ given a pool of its own.
   they are F16 or F32. The model's information gives the default per file, and a request can ask for either. Every
   FastConformer model declares the option, so that a request does not depend on the device the model was loaded on; on a
   model on the CPU both values decode there.
-- **The CPU decodes with the load's threads, in a pool that waits between graphs.** The model's information reports the
-  threads of a FastConformer model on a GPU, which can compute part of a request on the CPU.
+- **The CPU decodes in a pool that waits between graphs, with the load's threads where it gives them, and otherwise
+  with 4 where the prediction network is KDA and 8 where it is an LSTM**, not the machine's cores, which the load takes
+  by default for whatever else computes on the CPU. The model's information reports the threads in effect of a
+  FastConformer model on a GPU, which can compute part of a request on the CPU.
 
 The default follows the weights' type because the CPU computes a quantized step in less time than a round trip to the
 GPU on both machines measured, and an F16 step on the i9-9900K in about as long as Vulkan's round trip or longer. The
@@ -82,6 +94,10 @@ The alternatives were turned down:
   silicon; a discrete GPU on Vulkan has no buffer the CPU can read in place.
 - Decoding on the GPU alone. With quantized weights every step pays a round trip that costs more than the step's
   arithmetic.
+- The machine's performance cores, the load's default for the rest. Every step above took longer with 16 threads than
+  with 8, and Haas-ja's took longer than with 1 thread, its nodes' waits outgrowing their arithmetic.
+- 4 threads for every model, Haas-ja's fastest. parakeet-tdt-0.6b-v3's step took 25% longer than with 8.
+- 8 threads for every model. Haas-ja's step took 35% longer than with 4.
 - ggml's threads started for each graph. On the M5, reazonspeech-nemo-v2's beam search on 3 of the utterances above
   took 950 ms with 4 threads started for each graph and 856 ms with a pool of 4, where Metal took 1,091 ms.
 
