@@ -176,15 +176,35 @@ bool check_times(Recognizer & recognizer, const std::string & dump, const std::v
     const std::vector<Segment> segs = segments(texts, word_starts, nemo, separators, {});
     // The segments' number and texts are required whatever the times; their spans only where the times are.
     bool segment_texts = joined == want_text && segs.size() == want_segments.size(), segment_times = segs.size() == want_segments.size();
+    // NeMo makes a segment's text of its words, each decoded alone, so that a byte piece of a character of byte fallback
+    // gives U+FFFD, or its character where it is ASCII, where the recognizer writes the character the bytes make.
+    std::vector<std::string> nemo_texts = texts;
+    const std::vector<std::string> pieces = recognizer.model().str_array("fastconformer.tokenizer.tokens");
+    if (recognizer.model().boolean("fastconformer.tokenizer.byte_fallback")) {
+        for (size_t i = 0; i < decoding.ids.size(); i++) {
+            const std::string & p = pieces[(size_t) decoding.ids[i]];
+            if (p.size() == 6 && p.compare(0, 3, "<0x") == 0 && p[5] == '>') {
+                const int byte = std::stoi(p.substr(3, 2), nullptr, 16);
+                nemo_texts[i] = byte < 0x80 ? std::string(1, (char) byte) : std::string("\xef\xbf\xbd");
+            }
+        }
+    }
+    bool byte_pieces_apart = false;
     for (size_t k = 0; segs.size() == want_segments.size() && k < segs.size(); k++) {
-        segment_texts = segment_texts && without_spaces(segs[k].text) == without_spaces(want_segments[k]);
+        std::string as_nemo;
+        for (size_t i = segs[k].first; i < segs[k].end; i++) as_nemo += nemo_texts[i];
+        const bool same_text = without_spaces(segs[k].text) == without_spaces(want_segments[k]);
+        const bool apart = !same_text && without_spaces(as_nemo) == without_spaces(want_segments[k]);
+        byte_pieces_apart = byte_pieces_apart || apart;
+        segment_texts = segment_texts && (same_text || apart);
         segment_times = segment_times && segs[k].span.start == segment_offsets.i32[2 * k] && segs[k].span.end == segment_offsets.i32[2 * k + 1] &&
                         recognizer.seconds(segs[k].span.start) == segment_seconds.f64[2 * k] &&
                         recognizer.seconds(segs[k].span.end) == segment_seconds.f64[2 * k + 1];
     }
     const bool same_segments = segment_texts && (!times_required || segment_times);
     std::printf("  token texts %s; segments with the file's separators: texts %s, times %s\n",
-                joined == want_text ? "make the text" : "DO NOT make the text", segment_texts ? "equal" : "DIFFER",
+                joined == want_text ? "make the text" : "DO NOT make the text",
+                !segment_texts ? "DIFFER" : byte_pieces_apart ? "equal but for byte pieces, which NeMo decodes apart" : "equal",
                 segment_times ? "equal" : "DIFFER");
     if (!segment_texts || !segment_times) {
         for (const Segment & s : segs) std::printf("    got  %lld-%lld %s\n", (long long) s.span.start, (long long) s.span.end, s.text.c_str());

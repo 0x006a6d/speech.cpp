@@ -10,6 +10,10 @@ meta.json. The model runs on CUDA rather than the CPU,
 since the prediction network's Kimi Delta Attention runs on fla's Triton kernels alone, with TF32 off (pins.restore()).
 The text of the stages is asserted to equal what the official transcribe() returns with the model's default decoding,
 greedy TDT, here without CUDA graphs.
+
+Then each file goes through transcribe(timestamps=True), whose ids and text are asserted to be the stages', and the
+times it gives are saved beside them as reference/fastconformer/dump.py saves them: token_timestep, token_duration,
+token_offsets, token_seconds, segment_offsets, segment_seconds, segments.txt and times.json.
 """
 
 import argparse
@@ -34,6 +38,9 @@ pin = MODELS[args.model]
 device = "cuda"
 model = restore(pin, device)
 sample_rate = int(model.cfg.preprocessor.sample_rate)
+# What the checkpoint itself sets of the decoding's segments, read before transcribe(timestamps=True) merges every default
+# of the decoding's configuration into the checkpoint's.
+set_by_checkpoint = {key: key in model.cfg.decoding for key in ("segment_seperators", "word_seperator", "segment_gap_threshold")}
 # On CUDA, greedy TDT decoding runs its label looping in captured CUDA graphs, which call the prediction network and the
 # joint from inside the graphs, past the wrappers below; without them it runs the same label looping step by step.
 decoding = copy.deepcopy(model.cfg.decoding)
@@ -100,7 +107,7 @@ model.decoder.predict, model.joint.project_encoder, model.joint.project_prednet,
 
 
 def dump_stages(path):
-    """Saves the stages of the WAVE file at `path`."""
+    """Saves the stages of the WAVE file at `path` and returns the folder they went to."""
     samples, rate = soundfile.read(path, dtype="float32")
     assert rate == sample_rate and samples.ndim == 1, f"{path} is not mono at {sample_rate} Hz"
     name = os.path.splitext(os.path.basename(path))[0]
@@ -169,7 +176,59 @@ def dump_stages(path):
         f.write(text)
     json.dump(meta, open(os.path.join(out, "meta.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     print(json.dumps({k: v for k, v in meta.items() if k not in ("nemo", "fla", "model")}, ensure_ascii=False))
+    return out
+
+
+def dump_times(path, out):
+    """Saves the times transcribe(timestamps=True) gives for the WAVE file at `path` into the dump folder `out`."""
+    model.decoder.predict, model.joint.project_encoder, model.joint.project_prednet, model.joint.joint_after_projection = (
+        predict, project_encoder, project_prednet, joint_after_projection)
+    hypothesis = model.transcribe([path], batch_size=1, timestamps=True, verbose=False)[0]
+    model.decoder.predict, model.joint.project_encoder, model.joint.project_prednet, model.joint.joint_after_projection = (
+        recording_predict, recording_project_encoder, recording_project_prednet, recording_joint)
+    ids = [int(i) for i in hypothesis.y_sequence.tolist()]
+    assert model.decoding.blank_id not in ids
+    assert ids == np.load(os.path.join(out, "ids.npy")).tolist(), f"transcribe(timestamps=True) gives other ids for {path}"
+    with open(os.path.join(out, "text.txt"), encoding="utf-8", newline="") as f:
+        assert hypothesis.text == f.read(), f"transcribe(timestamps=True) gives another text for {path}"
+    stamps = hypothesis.timestamp
+    timestep = [int(t) for t in stamps["timestep"]]
+    duration = [int(d) for d in hypothesis.token_duration]
+    chars, words, segments = stamps["char"], stamps["word"], stamps["segment"]
+    assert len(timestep) == len(chars) == len(ids) == len(duration)
+
+    def pairs(entries, *keys):
+        return [[entry[k] for k in keys] for entry in entries]
+
+    arrays = {
+        "token_timestep": np.array(timestep, dtype=np.int32),
+        "token_duration": np.array(duration, dtype=np.int32),
+        "token_offsets": np.array(pairs(chars, "start_offset", "end_offset"), dtype=np.int32).reshape(-1, 2),
+        "token_seconds": np.array(pairs(chars, "start", "end"), dtype=np.float64).reshape(-1, 2),
+        "segment_offsets": np.array(pairs(segments, "start_offset", "end_offset"), dtype=np.int32).reshape(-1, 2),
+        "segment_seconds": np.array(pairs(segments, "start", "end"), dtype=np.float64).reshape(-1, 2),
+    }
+    for key, array in arrays.items():
+        np.save(os.path.join(out, f"{key}.npy"), np.ascontiguousarray(array))
+    assert all("\n" not in s["segment"] for s in segments)
+    with open(os.path.join(out, "segments.txt"), "w", encoding="utf-8", newline="") as f:
+        f.write("".join(s["segment"] + "\n" for s in segments))
+    times = {
+        "nemo": NEMO, "model": pin,
+        "segment_seperators": list(model.decoding.segment_seperators), "word_seperator": model.decoding.word_seperator,
+        "segment_gap_threshold": model.decoding.segment_gap_threshold, "set_by_checkpoint": set_by_checkpoint,
+        "supported_punctuation": sorted(model.decoding.supported_punctuation),
+        "tokenizer_type": model.decoding.tokenizer_type,
+        "subsampling_factor": int(model.encoder.subsampling_factor),
+        "window_stride": float(model.cfg.preprocessor.window_stride),
+        "timestep": timestep, "token_duration": duration,
+        "pieces": model.decoding.decode_ids_to_tokens(ids),
+        "char": [dict(c, char=list(c["char"])) for c in chars], "word": words, "segment": segments,
+    }
+    with open(os.path.join(out, "times.json"), "w", encoding="utf-8") as f:
+        json.dump(times, f, ensure_ascii=False, indent=1)
+    print(json.dumps({"dump": out, "tokens": len(ids), "segments": len(segments)}, ensure_ascii=False))
 
 
 for path in args.audio:
-    dump_stages(path)
+    dump_times(path, dump_stages(path))
