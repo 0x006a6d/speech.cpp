@@ -45,6 +45,11 @@ struct SpeakerScale {
     int layers = 0;
 };
 
+/** The inputs of a DiT graph that change from step to step: the latent and the step's time and interval. */
+struct DitStepInputs {
+    ggml_tensor * x = nullptr, * t = nullptr, * delta = nullptr;
+};
+
 /**
  * The text-to-latent DiT of Irodori-TTS: blocks of joint attention over the latent and the conditions,
  * each modulated by the step's time through a low-rank AdaLN. A MeanFlow model also takes the step's
@@ -62,12 +67,14 @@ public:
     /**
      * The velocity [latent_dim, frames, branches] of the latent x (row-major [frames, latent_dim]) at time t, with
      * `delta` the step's interval for a MeanFlow model, for each of `branches`, which form the batch, with the speaker's
-     * keys and values scaled by `scale` in the branches it reaches. `blocks`, when given, receives each block's output
-     * and `cond` the timestep condition.
+     * keys and values scaled by `scale` in the branches it reaches. `blocks`, when given, receives each block's output,
+     * `cond` the timestep condition and `step` the inputs that set_step() gives another step's data.
      */
     ggml_tensor * build(Graph & g, const std::vector<float> & x, int frames, float t, float delta, const Conditions & c,
                         const std::vector<Branch> & branches, const SpeakerScale & scale = {}, std::vector<ggml_tensor *> * blocks = nullptr,
-                        ggml_tensor ** cond = nullptr) const;
+                        ggml_tensor ** cond = nullptr, DitStepInputs * step = nullptr) const;
+    /** Gives the inputs `step` of a graph that build() made the latent x, time t and interval `delta` of another step. */
+    void set_step(Graph & g, const DitStepInputs & step, const std::vector<float> & x, float t, float delta) const;
 
 private:
     const ModelFile & m_;

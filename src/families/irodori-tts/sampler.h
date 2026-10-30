@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -113,6 +114,15 @@ public:
     int default_steps() const { return default_steps_; }
 
 private:
+    struct KeptStep;
+
+    /**
+     * velocity(), computing a graph that `kept` holds again where it was built for the same branches and scale, and
+     * keeping the graph of a step it builds there.
+     */
+    std::vector<float> velocity(const Conditions & c, const std::vector<float> & x, int frames, const std::vector<float> & times, int step,
+                                const Guidance & g, std::vector<float> * out, std::unique_ptr<KeptStep> & kept);
+
     const Dit & dit_;
     ggml_backend_t backend_;
     ggml_gallocr_t allocr_ = nullptr;

@@ -41,7 +41,7 @@ std::vector<float> timestep_embedding(float t, int dim) {
 
 ggml_tensor * Dit::build(Graph & g, const std::vector<float> & x_in, int frames, float t, float delta, const Conditions & c,
                          const std::vector<Branch> & branch_list, const SpeakerScale & scale, std::vector<ggml_tensor *> * blocks,
-                         ggml_tensor ** cond_out) const {
+                         ggml_tensor ** cond_out, DitStepInputs * step) const {
     ggml_context * ctx = g.ctx();
     const Layers l{ctx, m_, eps_, attention_};
     const int head_dim = dim_ / heads_, half = heads_ / 2;
@@ -57,15 +57,22 @@ ggml_tensor * Dit::build(Graph & g, const std::vector<float> & x_in, int frames,
         x = ggml_silu(ctx, mul_mat(ctx, m_.tensor(prefix + ".1"), x));
         return mul_mat(ctx, m_.tensor(prefix + ".2"), x);
     };
-    ggml_tensor * cond = mlp3("dit.cond", g.input(timestep_embedding(t, timestep_dim_), timestep_dim_));
-    if (meanflow_) cond = ggml_add(ctx, cond, mlp3("dit.delta_cond", g.input(timestep_embedding(delta, timestep_dim_), timestep_dim_)));
+    DitStepInputs in;
+    in.t = g.input(timestep_embedding(t, timestep_dim_), timestep_dim_);
+    ggml_tensor * cond = mlp3("dit.cond", in.t);
+    if (meanflow_) {
+        in.delta = g.input(timestep_embedding(delta, timestep_dim_), timestep_dim_);
+        cond = ggml_add(ctx, cond, mlp3("dit.delta_cond", in.delta));
+    }
     if (cond_out) *cond_out = cond;
     auto chunk = [&](int k) { return ggml_view_1d(ctx, cond, dim_, (size_t) k * dim_ * ggml_element_size(cond)); };
 
     // Every branch starts from the same latent; they part where their conditions differ.
     std::vector<float> x_rep;
     for (int b = 0; b < branches; b++) x_rep.insert(x_rep.end(), x_in.begin(), x_in.end());
-    ggml_tensor * x = l.linear(g.input(x_rep, latent_dim_, s, branches), "dit.in_proj");
+    in.x = g.input(x_rep, latent_dim_, s, branches);
+    if (step) *step = in;
+    ggml_tensor * x = l.linear(in.x, "dit.in_proj");
 
     ggml_tensor * text = g.input(c.text, c.text.size() / c.text_tokens, c.text_tokens);
     const bool has_speaker = c.speaker_tokens > 0;
@@ -167,6 +174,14 @@ ggml_tensor * Dit::build(Graph & g, const std::vector<float> & x_in, int frames,
         if (blocks) blocks->push_back(x);
     }
     return l.linear(l.rms(x, "dit.out_norm"), "dit.out_proj");
+}
+
+void Dit::set_step(Graph & g, const DitStepInputs & step, const std::vector<float> & x, float t, float delta) const {
+    std::vector<float> x_rep;
+    for (int64_t b = 0; b < step.x->ne[2]; b++) x_rep.insert(x_rep.end(), x.begin(), x.end());
+    g.set(step.x, x_rep);
+    g.set(step.t, timestep_embedding(t, timestep_dim_));
+    if (step.delta) g.set(step.delta, timestep_embedding(delta, timestep_dim_));
 }
 
 }  // namespace irodori

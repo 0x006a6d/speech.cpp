@@ -205,16 +205,54 @@ SpeakerScale Sampler::speaker_scale(const Guidance & g, const std::vector<float>
     return {g.speaker_kv_scale, g.speaker_kv_layers};
 }
 
+/**
+ * The graph of a step of one sampling, which the steps after it with the same branches and scale compute again, their
+ * latent and time given anew: on CUDA with its graphs, ggml captures a graph that is computed again and launches the
+ * capture for the steps after it, where a graph built anew for each step was captured and thrown away.
+ */
+struct Sampler::KeptStep {
+    Graph graph;
+    std::vector<Branch> branches;
+    SpeakerScale scale;
+    DitStepInputs inputs;
+    ggml_tensor * result = nullptr;
+
+    bool serves(const std::vector<Branch> & b, const SpeakerScale & s) const {
+        const auto same = [](const Branch & p, const Branch & q) {
+            return p.text == q.text && p.speaker == q.speaker && p.scaled == q.scaled && p.caption == q.caption;
+        };
+        return s.factor == scale.factor && s.layers == scale.layers && b.size() == branches.size() &&
+               std::equal(b.begin(), b.end(), branches.begin(), same);
+    }
+};
+
 std::vector<float> Sampler::velocity(const Conditions & c, const std::vector<float> & x, int frames, const std::vector<float> & times, int step,
                                      const Guidance & g, std::vector<float> * out) {
+    std::unique_ptr<KeptStep> kept;
+    return velocity(c, x, frames, times, step, g, out, kept);
+}
+
+std::vector<float> Sampler::velocity(const Conditions & c, const std::vector<float> & x, int frames, const std::vector<float> & times, int step,
+                                     const Guidance & g, std::vector<float> * out, std::unique_ptr<KeptStep> & kept) {
     const float t = times[step], t_next = times[step + 1];
     std::vector<float> scales;
     const std::vector<Branch> b = branches(step, t, g, &scales);
-    Graph graph;
-    ggml_tensor * result = dit_.build(graph, x, frames, t, t - t_next, c, b, speaker_scale(g, times, step));
-    graph.output(result);
-    graph.compute(backend_, allocr_);
-    std::vector<float> v = Graph::read(result);
+    const SpeakerScale scale = speaker_scale(g, times, step);
+    if (kept && kept->serves(b, scale)) {
+        dit_.set_step(kept->graph, kept->inputs, x, t, t - t_next);
+        kept->graph.compute_again(backend_);
+    } else {
+        // A graph is kept only once it has computed, and the allocator's next graph takes the memory of the one before.
+        kept.reset();
+        auto built = std::make_unique<KeptStep>();
+        built->branches = b;
+        built->scale = scale;
+        built->result = dit_.build(built->graph, x, frames, t, t - t_next, c, b, scale, nullptr, nullptr, &built->inputs);
+        built->graph.output(built->result);
+        built->graph.compute(backend_, allocr_);
+        kept = std::move(built);
+    }
+    std::vector<float> v = Graph::read(kept->result);
     if (out) *out = v;
     const size_t n = x.size();
     if (b.size() > 1) {
@@ -242,9 +280,10 @@ std::vector<float> Sampler::sample(const Conditions & c, std::vector<float> x, i
     if (g.truncation) {
         for (float & v : x) v = v * *g.truncation;
     }
+    std::unique_ptr<KeptStep> kept;
     for (int i = 0; i < steps; i++) {
         if (progress && !progress((double) i / steps)) return {};
-        const std::vector<float> v = velocity(c, x, frames, times, i, g);
+        const std::vector<float> v = velocity(c, x, frames, times, i, g, nullptr, kept);
         const float dt = times[i + 1] - times[i];
         for (size_t j = 0; j < x.size(); j++) x[j] = x[j] + v[j] * dt;
     }
