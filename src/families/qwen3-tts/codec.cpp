@@ -181,23 +181,49 @@ void CodecDecoder::reset() {
     n_past_ = 0;
 }
 
-void CodecDecoder::decode(const int32_t * codes, int n_frames, std::vector<float> & out) {
-    if (n_frames <= 0) return;
+/**
+ * The graph of a decode of `t` frames, which the decodes after it of as many frames compute again with their codes,
+ * positions and mask, the states it reads and writes staying where they are. On CUDA with its graphs, ggml captures a
+ * graph that is computed again and launches the capture for the decodes after it, where a graph built anew for each
+ * chunk was captured and thrown away: the 0.6B model's codec took 878 ms of captures that were never launched again in
+ * ten syntheses on an RTX 5090 under WSL 2 (2026-10-30).
+ */
+struct CodecDecoder::KeptGraph {
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    int64_t t = 0;
+    std::vector<ggml_tensor *> ids;
+    ggml_tensor * pos = nullptr, * mask = nullptr, * out = nullptr;
+
+    KeptGraph() = default;
+    KeptGraph(const KeptGraph &) = delete;
+    KeptGraph & operator=(const KeptGraph &) = delete;
+    ~KeptGraph() {
+        if (ctx) ggml_free(ctx);
+    }
+};
+
+std::unique_ptr<CodecDecoder::KeptGraph> CodecDecoder::build(int64_t t) {
     const ModelFile & m = m_;
     auto state = [&](const std::string & name) {
-        ggml_tensor * t = ggml_get_tensor(state_ctx_, ("state." + name).c_str());
-        if (!t) throw std::runtime_error("missing codec state " + name);
-        return t;
+        ggml_tensor * found = ggml_get_tensor(state_ctx_, ("state." + name).c_str());
+        if (!found) throw std::runtime_error("missing codec state " + name);
+        return found;
     };
 
+    auto kept = std::make_unique<KeptGraph>();
     ggml_init_params params = {ggml_tensor_overhead() * kGraphSize + ggml_graph_overhead_custom(kGraphSize, false),
                                nullptr, true};
-    ggml_context * ctx = ggml_init(params);
+    kept->ctx = ggml_init(params);
+    if (!kept->ctx) throw Error(Fault::OutOfMemory, "cannot create a ggml context for the codec's graph");
+    kept->t = t;
+    ggml_context * ctx = kept->ctx;
     CodecGraph g{ctx, ggml_new_graph_custom(ctx, kGraphSize, false)};
-    const int64_t t = n_frames;
+    kept->gf = g.gf;
 
     // Residual vector quantization: the first codebook and the other fifteen each have their own projection.
-    std::vector<ggml_tensor *> ids(n_q_);
+    std::vector<ggml_tensor *> & ids = kept->ids;
+    ids.resize(n_q_);
     ggml_tensor * rest = nullptr;
     for (int q = 0; q < n_q_; q++) {
         ids[q] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, t);
@@ -292,21 +318,34 @@ void CodecDecoder::decode(const int32_t * codes, int n_frames, std::vector<float
     ggml_set_output(x);
     ggml_build_forward_expand(g.gf, x);
 
-    if (!ggml_gallocr_alloc_graph(allocr_, g.gf)) {
-        ggml_free(ctx);
-        throw Error(Fault::OutOfMemory, "cannot allocate the memory of the codec's graph on the device");
+    if (!ggml_gallocr_alloc_graph(allocr_, g.gf)) throw Error(Fault::OutOfMemory, "cannot allocate the memory of the codec's graph on the device");
+    kept->pos = pos;
+    kept->mask = mask;
+    kept->out = x;
+    return kept;
+}
+
+void CodecDecoder::decode(const int32_t * codes, int n_frames, std::vector<float> & out) {
+    if (n_frames <= 0) return;
+    const int64_t t = n_frames;
+    if (!kept_ || kept_->t != t) {
+        // The allocator gives the next graph the memory of the kept one.
+        kept_.reset();
+        kept_ = build(t);
     }
+    const KeptGraph & k = *kept_;
 
     std::vector<int32_t> column(t);
     for (int q = 0; q < n_q_; q++) {
         for (int64_t f = 0; f < t; f++) column[f] = codes[f * n_q_ + q];
-        ggml_backend_tensor_set(ids[q], column.data(), 0, t * sizeof(int32_t));
+        ggml_backend_tensor_set(k.ids[q], column.data(), 0, t * sizeof(int32_t));
     }
     std::vector<int32_t> positions(t);
     for (int64_t i = 0; i < t; i++) positions[i] = (int32_t) (n_past_ + i);
-    ggml_backend_tensor_set(pos, positions.data(), 0, t * sizeof(int32_t));
+    ggml_backend_tensor_set(k.pos, positions.data(), 0, t * sizeof(int32_t));
     // Key j holds absolute position n_past - window + j for the carried part and n_past + (j - window)
     // for the new frames; a query attends to the keys of the last `window` positions up to its own.
+    const int64_t n_kv = window_ + t;
     std::vector<float> mask_data(n_kv * t);
     for (int64_t i = 0; i < t; i++) {
         const int64_t qp = n_past_ + i;
@@ -316,17 +355,11 @@ void CodecDecoder::decode(const int32_t * codes, int n_frames, std::vector<float
             mask_data[i * n_kv + j] = visible ? 0.0f : -INFINITY;
         }
     }
-    ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size() * sizeof(float));
+    ggml_backend_tensor_set(k.mask, mask_data.data(), 0, mask_data.size() * sizeof(float));
 
-    try {
-        compute_graph(backend_, g.gf);
-    } catch (...) {
-        ggml_free(ctx);
-        throw;
-    }
+    compute_graph(backend_, k.gf);
     const size_t base = out.size();
-    out.resize(base + ggml_nelements(x));
-    ggml_backend_tensor_get(x, out.data() + base, 0, ggml_nbytes(x));
+    out.resize(base + ggml_nelements(k.out));
+    ggml_backend_tensor_get(k.out, out.data() + base, 0, ggml_nbytes(k.out));
     n_past_ += t;
-    ggml_free(ctx);
 }

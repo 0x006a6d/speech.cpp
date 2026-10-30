@@ -119,6 +119,19 @@ public:
 };
 
 /**
+ * The input row of a step that Qwen3Decoder::step() keeps on a GPU: built once in the step's graph, with inputs for what
+ * changes from step to step, and given the next step's data while the graph serves it.
+ */
+class Qwen3StepRow {
+public:
+    virtual ~Qwen3StepRow() = default;
+    /** Builds the step's row, [hidden, 1], in `g`. */
+    virtual ggml_tensor * build(Graph & g) = 0;
+    /** Gives the inputs that build() made in `g` the data of the next step. */
+    virtual void refill(Graph & g) = 0;
+};
+
+/**
  * A Qwen3 decoder stack of a model file: in each layer, RMSNorm, attention with grouped key/value heads, RMSNorm of
  * each head's queries and keys and rotate-half RoPE, and RMSNorm and a SwiGLU feed-forward; and RMSNorm at the end.
  * Its tensors are `<tensors>.blk.<layer>.` attn_norm, attn_q, attn_k, attn_v, attn_q_norm, attn_k_norm, attn_o,
@@ -184,6 +197,12 @@ public:
     void step(int32_t id, ggml_tensor * table, ggml_tensor * head);
 
     /**
+     * Feeds the row that `row` builds after the sequence and reads it as step() with an id does, keeping the graph for
+     * the steps of the same `row`, which lives as long as the decoder or until another row steps.
+     */
+    void step(Qwen3StepRow & row, ggml_tensor * head);
+
+    /**
      * Feeds the tokens `ids`, whose rows of `table` are their inputs, after the sequence in one graph, and returns for
      * each the greedy pick of the token after it under `head`, the first of its largest logits, picked on the device;
      * `logits`, where given, gets every row's logits, [ids, vocabulary] row-major. The rows are computed together, which
@@ -223,6 +242,17 @@ private:
     struct Cache;
     struct TokenStep;
     struct KeptChain;
+    /** The row of a token's step: its id's row of a table. */
+    class TableRow : public Qwen3StepRow {
+    public:
+        ggml_tensor * table = nullptr;
+        int32_t id = 0;
+        ggml_tensor * build(Graph & g) override;
+        void refill(Graph & g) override;
+
+    private:
+        ggml_tensor * input_ = nullptr;
+    };
 
     /** The inputs of a run's graph that depend on where its rows are in the sequence. */
     struct RunInputs {
@@ -275,6 +305,7 @@ private:
     const bool flash_;
 
     std::unique_ptr<Cache> cache_;
+    TableRow table_row_;
     std::unique_ptr<TokenStep> token_step_;
     std::unique_ptr<KeptChain> chain_;
     ggml_gallocr_t allocr_ = nullptr;

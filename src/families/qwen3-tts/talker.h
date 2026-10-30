@@ -68,6 +68,7 @@ public:
 
 private:
     class Frame;
+    class FrameRow;
 
     const std::vector<float> & run_cp(int32_t code, int group);
     /** The code predictor's input rows from rows in the talker's hidden space, [talker hidden, n]. */
@@ -83,4 +84,5 @@ private:
     /** The allocator of the embedding graphs; each decoder has its own. */
     ggml_gallocr_t allocr_ = nullptr;
     std::unique_ptr<Frame> frame_;
+    std::unique_ptr<FrameRow> frame_row_;
 };

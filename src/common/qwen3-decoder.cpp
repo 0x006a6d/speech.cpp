@@ -185,23 +185,26 @@ struct Qwen3Decoder::Cache {
 };
 
 /**
- * The graph of a step whose input is a row of a table looked up by a token's id, which flash attention computes again
- * for the steps after it while they read the same cache and block of positions, their id, positions and mask given
- * anew: a step of the 0.6B Qwen3-ASR decoder at 350 to 450 positions took 6.5 ms building and allocating its graph and
- * takes 6.3 ms with the kept one on an Apple M5 in Q8_0 on Metal, interleaved in one process (2026-10-07). It has an
- * allocator of its own, so that no other graph moves its tensors.
+ * The graph of a step, which flash attention computes again for the steps after it of the same row while they read the
+ * same cache and block of positions, their row, positions and mask given anew: a step of the 0.6B Qwen3-ASR decoder at
+ * 350 to 450 positions took 6.5 ms building and allocating its graph and takes 6.3 ms with the kept one on an Apple M5
+ * in Q8_0 on Metal, interleaved in one process (2026-10-07). On CUDA with its graphs, ggml captures a graph that is
+ * computed again and launches the capture for the steps after it, where a graph built anew for each step was captured
+ * and thrown away: a frame of the 0.6B Qwen3-TTS talker in Q8_0 took 7.0 to 7.7 ms built anew and takes 1.9 to 2.0 ms
+ * kept on an RTX 5090, interleaved over three rounds (2026-10-29).
+ * It has an allocator of its own, so that no other graph moves its tensors.
  */
 struct Qwen3Decoder::TokenStep {
     Graph graph{kGraphSize};
     ggml_gallocr_t allocr;
-    ggml_tensor * table, * head;
+    Qwen3StepRow * row;
+    ggml_tensor * head;
     int64_t n_kv;
-    ggml_tensor * id = nullptr;
     Outputs outputs;
     RunInputs inputs;
 
-    TokenStep(ggml_backend_t backend, ggml_tensor * table, ggml_tensor * head, int64_t n_kv)
-        : allocr(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend))), table(table), head(head), n_kv(n_kv) {}
+    TokenStep(ggml_backend_t backend, Qwen3StepRow * row, ggml_tensor * head, int64_t n_kv)
+        : allocr(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend))), row(row), head(head), n_kv(n_kv) {}
     ~TokenStep() { ggml_gallocr_free(allocr); }
     TokenStep(const TokenStep &) = delete;
     TokenStep & operator=(const TokenStep &) = delete;
@@ -459,16 +462,33 @@ void Qwen3Decoder::run(int64_t n, const Qwen3Rows & rows, ggml_tensor * head) {
     }
 }
 
+ggml_tensor * Qwen3Decoder::TableRow::build(Graph & g) {
+    input_ = g.input(std::vector<int32_t>{id}, 1);
+    return ggml_get_rows(g.ctx(), table, input_);
+}
+
+void Qwen3Decoder::TableRow::refill(Graph & g) {
+    g.set(input_, std::vector<int32_t>{id});
+}
+
 void Qwen3Decoder::step(int32_t id, ggml_tensor * table, ggml_tensor * head) {
+    // A kept step looked its row up in the table it was built with.
+    if (table_row_.table != table && token_step_ && token_step_->row == &table_row_) token_step_.reset();
+    table_row_.table = table;
+    table_row_.id = id;
+    step(table_row_, head);
+}
+
+void Qwen3Decoder::step(Qwen3StepRow & row, ggml_tensor * head) {
     if (!flash_) {
-        run(1, [&](Graph & g, int64_t, int64_t) { return ggml_get_rows(g.ctx(), table, g.input(std::vector<int32_t>{id}, 1)); }, head);
+        run(1, [&](Graph & g, int64_t, int64_t) { return row.build(g); }, head);
         return;
     }
     make_room(1);
     const int64_t n_kv = round_up(n_past_ + 1, kAttentionBlock);
     TokenStep * s = token_step_.get();
-    if (s && s->table == table && s->head == head && s->n_kv == n_kv) {
-        s->graph.set(s->id, std::vector<int32_t>{id});
+    if (s && s->row == &row && s->head == head && s->n_kv == n_kv) {
+        row.refill(s->graph);
         s->graph.set(s->inputs.positions, positions_after(n_past_, 1));
         s->graph.set(s->inputs.mask, causal_mask(n_past_, 1, n_kv));
         s->graph.compute_again(backend_);
@@ -476,11 +496,11 @@ void Qwen3Decoder::step(int32_t id, ggml_tensor * table, ggml_tensor * head) {
         // The step is kept only once it has computed: a graph whose memory could not be allocated has tensors without
         // memory, which computing it again would write to and abort.
         token_step_.reset();
-        auto built = std::make_unique<TokenStep>(backend_, table, head, n_kv);
+        auto built = std::make_unique<TokenStep>(backend_, &row, head, n_kv);
         s = built.get();
-        s->id = s->graph.input(std::vector<int32_t>{id}, 1);
+        ggml_tensor * input = row.build(s->graph);
         s->inputs = run_inputs(s->graph, 1);
-        ggml_tensor * x = layers(s->graph, ggml_get_rows(s->graph.ctx(), table, s->id), 1, true, s->inputs);
+        ggml_tensor * x = layers(s->graph, input, 1, true, s->inputs);
         s->outputs = outputs(s->graph, x, head);
         s->graph.compute(backend_, s->allocr);
         token_step_ = std::move(built);

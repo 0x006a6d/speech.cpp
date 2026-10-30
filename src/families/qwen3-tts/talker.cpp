@@ -80,6 +80,49 @@ private:
     ggml_tensor * hidden_ = nullptr, * code0_input_ = nullptr;
 };
 
+/**
+ * A frame's row of the talker: the sum of its codes' embeddings, the first from the talker's table, the others from the
+ * code predictor's, which live in the talker's hidden space, plus the frame's extra row. The codes go to the device as
+ * one input, each read through a view of it: an upload took about 0.06 ms on Windows with Vulkan, and one upload instead
+ * of sixteen took 1.6% off the 1.7B model's synthesis on an RTX 2080 (2026-10-12).
+ */
+class Talker::FrameRow : public Qwen3StepRow {
+public:
+    explicit FrameRow(const Talker & t) : t_(t) {}
+
+    /** Takes the data of the next frame, which `codes` and `extra` hold until the step has run. */
+    void next(const int32_t * codes, const std::vector<float> & extra) {
+        codes_ = codes;
+        extra_ = &extra;
+    }
+
+    ggml_tensor * build(Graph & g) override {
+        const ModelFile & m = t_.m_;
+        ggml_context * ctx = g.ctx();
+        ids_ = g.input(codes(), t_.n_groups_);
+        const auto id = [&](int q) { return ggml_view_1d(ctx, ids_, 1, (size_t) q * ids_->nb[0]); };
+        ggml_tensor * x = ggml_get_rows(ctx, m.tensor("talker.codec_embd"), id(0));
+        for (int q = 1; q < t_.n_groups_; q++) {
+            x = ggml_add(ctx, x, ggml_get_rows(ctx, m.tensor("cp.codec_embd." + std::to_string(q - 1)), id(q)));
+        }
+        extra_input_ = g.input(*extra_, t_.hidden());
+        return ggml_add(ctx, x, extra_input_);
+    }
+
+    void refill(Graph & g) override {
+        g.set(ids_, codes());
+        g.set(extra_input_, *extra_);
+    }
+
+private:
+    std::vector<int32_t> codes() const { return std::vector<int32_t>(codes_, codes_ + t_.n_groups_); }
+
+    const Talker & t_;
+    const int32_t * codes_ = nullptr;
+    const std::vector<float> * extra_ = nullptr;
+    ggml_tensor * ids_ = nullptr, * extra_input_ = nullptr;
+};
+
 Talker::~Talker() {
     if (allocr_) ggml_gallocr_free(allocr_);
 }
@@ -117,24 +160,9 @@ void Talker::prefill(const std::vector<float> & embeds, int n, int64_t positions
 }
 
 void Talker::step(const int32_t * codes, const std::vector<float> & extra) {
-    const ModelFile & m = m_;
-    talker_.run(
-        1,
-        [&](Graph & g, int64_t, int64_t) {
-            // A frame's input is the sum of its codes' embeddings: the first from the talker's table, the
-            // others from the code predictor's, which live in the talker's hidden space. The codes go to the device as
-            // one input, each read through a view of it: an upload took about 0.06 ms on Windows with Vulkan, and
-            // one upload instead of sixteen took 1.6% off the 1.7B model's synthesis on an RTX 2080 (2026-10-12).
-            ggml_context * ctx = g.ctx();
-            ggml_tensor * ids = g.input(std::vector<int32_t>(codes, codes + n_groups_), n_groups_);
-            const auto id = [&](int q) { return ggml_view_1d(ctx, ids, 1, (size_t) q * ids->nb[0]); };
-            ggml_tensor * x = ggml_get_rows(ctx, m.tensor("talker.codec_embd"), id(0));
-            for (int q = 1; q < n_groups_; q++) {
-                x = ggml_add(ctx, x, ggml_get_rows(ctx, m.tensor("cp.codec_embd." + std::to_string(q - 1)), id(q)));
-            }
-            return ggml_add(ctx, x, g.input(extra, hidden()));
-        },
-        m.tensor("talker.codec_head"));
+    if (!frame_row_) frame_row_ = std::make_unique<FrameRow>(*this);
+    frame_row_->next(codes, extra);
+    talker_.step(*frame_row_, m_.tensor("talker.codec_head"));
 }
 
 ggml_tensor * Talker::cp_input(ggml_context * ctx, ggml_tensor * x) const {

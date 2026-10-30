@@ -40,7 +40,10 @@ public:
 
 private:
     struct State;
+    struct KeptGraph;
     ggml_tensor * state_tensor(const std::string & name, int64_t ne0, int64_t ne1);
+    /** Builds and allocates the graph of a decode of `t` frames. */
+    std::unique_ptr<KeptGraph> build(int64_t t);
 
     ggml_backend_t backend_;
     const ModelFile & m_;
@@ -64,4 +67,5 @@ private:
     std::vector<int32_t> upsampling_ratios_;
     int samples_per_frame_ = 0;
     int64_t n_past_ = 0;
+    std::unique_ptr<KeptGraph> kept_;
 };
