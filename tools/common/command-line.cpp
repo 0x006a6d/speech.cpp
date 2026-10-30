@@ -225,7 +225,7 @@ Flag device_flag(const std::string & help) {
 }
 
 Flag threads_flag() {
-    return {"--threads", "N", false, "the CPU's threads, 1 or more; the machine's performance cores unless given"};
+    return {"--threads", "N", false, "the CPU's threads, 1 or more; the machine's performance cores unless given, or 4 or 8 for the decoding on the CPU of a FastConformer model on a GPU"};
 }
 
 Flag add_voice_flag() {

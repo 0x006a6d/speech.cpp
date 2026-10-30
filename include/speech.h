@@ -475,8 +475,9 @@ SPEECH_API speech_status speech_load_params_set_device(speech_load_params * para
  * The number of threads the CPU computes with, 1 or more: a preference about how the work runs, which applies to
  * whatever the model computes on the CPU: all of its graphs for a model on the CPU, and for a model on a GPU those it
  * computes on the CPU, such as a decoding with decode_on_cpu, or none. Without it the library takes the machine's
- * performance cores, or its physical cores where the system does not tell them apart. The model's information reports
- * the number in effect (speech_model_info_threads()).
+ * performance cores, or its physical cores where the system does not tell them apart, but for a FastConformer model on
+ * a GPU, whose decoding on the CPU computes small graphs faster with fewer threads: 4 where its prediction network is
+ * Kimi Delta Attention, else 8. The model's information reports the number in effect (speech_model_info_threads()).
  */
 SPEECH_API speech_status speech_load_params_set_threads(speech_load_params * params, int threads);
 

@@ -57,7 +57,8 @@ speech info irodori-tts-mf
 - **MODEL** is a model file, whose path ends in `.gguf`, or `NAME[:TYPE]` of a model in `speech models`, which is
   fetched the first time it is used ([models.md](models.md)).
 - **`--device NAME`** is `auto` (the default: the first GPU, or the CPU on a machine without one), `gpu`, `cpu`, or a
-  name that `speech devices` lists. **`--threads N`** is the CPU's threads; by default the machine's performance cores.
+  name that `speech devices` lists. **`--threads N`** is the CPU's threads; by default the machine's performance cores,
+  but 4 or 8 for a FastConformer model's decoding on the CPU while the model is on a GPU.
 - **Request options.** `speech tts`, `speech asr` and `speech vad` take every option of the C API's vocabulary as a flag
   of its name in kebab-case: `duration_scale` is `--duration-scale` ([c-api.md](c-api.md#options)). The model refuses
   an option it does not take, as the C API does: Qwen3-TTS answers `--speed 1.5` with `speech: unsupported (speed): ...`.

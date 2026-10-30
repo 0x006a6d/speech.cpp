@@ -44,6 +44,8 @@ Recognizer::Recognizer(const std::string & path, ggml_backend_t backend, int thr
       breaks_(model_.str_array("fastconformer.segment.breaks")),
       allocr_(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend))) {
     if (!allocr_) throw Error(Fault::OutOfMemory, "cannot create a graph allocator");
+    if (threads_ < 0) throw std::invalid_argument("a recognizer's threads are negative");
+    if (threads_ == 0) threads_ = model_.str("fastconformer.decoder.prediction") == "kda" ? 4 : 8;
 }
 
 Recognizer::~Recognizer() {

@@ -56,7 +56,7 @@ public:
         }
     }
 
-    bool computes_on_cpu() const override { return true; }
+    int cpu_threads() const override { return recognizer_.decoding_threads(); }
 
 private:
     fastconformer::Recognizer recognizer_;

@@ -116,7 +116,9 @@ and link `speech.lib`. Inside this CMake project, link the target `speech` (shar
     compared without case. A device asked for by `gpu` or by name that is not there or does not start is an error, and
     no other device takes its place.
   - the CPU's threads, which apply to whatever runs on the CPU; by default the machine's performance cores, or its
-    physical cores where the system does not tell them apart.
+    physical cores where the system does not tell them apart, but 4 or 8 for the decoding on the CPU of a FastConformer
+    model on a GPU (4 where its prediction network is Kimi Delta Attention), whose small graphs fewer threads compute
+    faster.
   - a warm-up that runs a short request while the model loads, so that a GPU compiles its kernels before the first
     request. It is off by default; `speech worker` and `speech serve` turn it on.
 - **Model information.** `speech_model_info_open()` reads what a model file says of its model from its metadata, without

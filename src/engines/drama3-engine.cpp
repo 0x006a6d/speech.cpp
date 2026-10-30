@@ -67,7 +67,8 @@ Placement place_experts(const std::string & path, ggml_backend_t backend) {
 class Drama3Engine : public Engine {
 public:
     Drama3Engine(const std::string & path, ggml_backend_t backend, int threads)
-        : placement_(place_experts(path, backend)),
+        : threads_(threads),
+          placement_(place_experts(path, backend)),
           cpu_(placement_.held < placement_.layers ? start_device(find_device("cpu"), threads) : nullptr, ggml_backend_free),
           pool_(nullptr, ggml_threadpool_free),
           model_(path, drama3::model_layout,
@@ -87,7 +88,7 @@ public:
         voices_.emplace(kNoReference, drama3::Voice{});
     }
 
-    bool computes_on_cpu() const override { return cpu_ != nullptr; }
+    int cpu_threads() const override { return cpu_ ? threads_ : 0; }
 
     speech_stop speak(const std::string & text, const RequestValues & values, Run & run) override {
         if (cpu_ && !values.boolean(SPEECH_OPT_EXPERTS_ON_CPU)) {
@@ -145,6 +146,8 @@ public:
     }
 
 private:
+    /** The threads of the CPU's experts. */
+    int threads_;
     /** Where the routed experts are: the model's device holds those of the first layers, and the CPU the rest. */
     Placement placement_;
     /** The CPU's backend and its threads, where the CPU holds the experts of some layers. */
@@ -197,7 +200,7 @@ FamilyInfo describe_drama3(const std::shared_ptr<const ModelFile> & file) {
 }
 
 std::unique_ptr<Engine> load_drama3(const std::string & path, ggml_backend_t backend, int threads) {
-    return std::make_unique<Drama3Engine>(path, backend, threads);
+    return std::make_unique<Drama3Engine>(path, backend, threads > 0 ? threads : default_threads());
 }
 
 void make_drama3_voice(const std::string & model_path, const VoiceRecipe & recipe, const std::string & voice_path, ggml_backend_t backend) {

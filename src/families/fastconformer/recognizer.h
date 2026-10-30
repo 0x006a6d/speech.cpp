@@ -36,7 +36,8 @@ class Recognizer {
 public:
     /**
      * Loads the model at `path` onto `backend`. When `backend` is not the CPU, the first decoding on the CPU copies the
-     * tensors of decoding_tensor() from it onto a CPU backend of its own that computes with `threads` threads.
+     * tensors of decoding_tensor() from it onto a CPU backend of its own that computes with `threads` threads, or with
+     * 0 the decoding's own default (decoding_threads()).
      */
     Recognizer(const std::string & path, ggml_backend_t backend, int threads);
     ~Recognizer();
@@ -90,6 +91,16 @@ public:
     /** The decoding of decodings() named `name` on the model's device. */
     const Decoder & decoder(const std::string & name) const { return device_.decoder(name); }
     const Detokenizer & detokenizer() const { return detokenizer_; }
+    /**
+     * The threads of a decoding on the CPU for a model on another device. A step of the decoding is a graph of small
+     * nodes, after each of which every thread waits for the others, so the machine's cores are too many by default:
+     * on a Ryzen 9 9950X3D (16 cores) with the model on an RTX 5090, a step in Q8_0 took 122, 165 and 205 us with
+     * 4, 8 and 16 threads for Haas-ja-v1.0, whose Kimi Delta Attention computes 105 nodes, and 91, 90 and 105 us for
+     * parakeet-tdt_ctc-0.6b-ja's LSTM, 35 nodes; reazonspeech-nemo-v2's beam search took 271, 248 and 283 us and
+     * parakeet-tdt-0.6b-v3's step in F16 99, 79 and 82 us (2026-10-31, medians of 21 decodings of a FLEURS utterance).
+     */
+    int decoding_threads() const { return threads_; }
+
     /** Whether the model is on the CPU, where DecodeOn::Device decodes too. */
     bool on_cpu() const { return on_cpu_; }
 

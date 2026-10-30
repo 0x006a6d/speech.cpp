@@ -425,9 +425,12 @@ speech_status speech_model_load(const char * path, const speech_load_params * pa
         ggml_backend_dev_t device = find_device(p.device);
         const int threads = p.threads > 0 ? p.threads : default_threads();
         m->backend.reset(start_device(device, threads));
-        m->engine = m->file->family->load(path, m->backend.get(), threads);
+        // A model on the CPU computes every graph with the backend's threads; a model on a GPU is given the load's threads,
+        // or none for its family's default, for what it computes on the CPU.
+        const bool cpu = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        m->engine = m->file->family->load(path, m->backend.get(), cpu ? threads : p.threads);
         m->device = ggml_backend_dev_name(device);
-        m->threads = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU || m->engine->computes_on_cpu() ? threads : 0;
+        m->threads = cpu ? threads : m->engine->cpu_threads();
         if (p.warmup) m->engine->warm_up();
         *model = m.release();
         return SPEECH_OK;

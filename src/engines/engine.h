@@ -255,9 +255,12 @@ public:
     /** Runs a short request of the model's task, so that a GPU compiles its kernels before the first request. */
     virtual void warm_up() = 0;
 
-    /** Whether some of the graphs of a model on a GPU compute on the CPU, with the threads the model was loaded with. */
-    virtual bool computes_on_cpu() const { return false; }
+    /** The threads with which some of the graphs of a model on a GPU compute on the CPU, or 0 where none do. */
+    virtual int cpu_threads() const { return 0; }
 };
+
+// Each family describes a model file and loads a model onto a backend; `threads` is the load's threads for what it
+// computes on the CPU, or 0 for the family's own default.
 
 FamilyInfo describe_qwen3_tts(const std::shared_ptr<const ModelFile> & file);
 std::unique_ptr<Engine> load_qwen3_tts(const std::string & path, ggml_backend_t backend, int threads);
